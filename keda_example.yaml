@@ -1,0 +1,33 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: gcp-sync-streaming-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: gcp-sync-streaming-deployment
+  pollingInterval: 30
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 50
+  triggers:
+    # Trigger 1: Scales based on topic-a's backlog
+    - type: gcp-pubsub
+      metadata:
+        subscriptionName: "topic-a"
+        subscriptionSize: "500" # Target backlog per pod
+        credentialsFromEnv: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        
+    # Trigger 2: Scales based on topic-b's backlog
+    - type: gcp-pubsub
+      metadata:
+        subscriptionName: "topic-b"
+        subscriptionSize: "500"
+        credentialsFromEnv: GOOGLE_APPLICATION_CREDENTIALS_JSON
+
+    # Trigger 3: Scales based on topic-c's backlog
+    - type: gcp-pubsub
+      metadata:
+        subscriptionName: "topic-c"
+        subscriptionSize: "500"
+        credentialsFromEnv: GOOGLE_APPLICATION_CREDENTIALS_JSON

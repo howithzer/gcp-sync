@@ -1,0 +1,45 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gcp-sync-topics
+data:
+  topics.json: |
+    {
+      "topics": ["projects/my-project/subscriptions/topic-a", "projects/my-project/subscriptions/topic-b"]
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-sync-test
+  annotations:
+    # OPTION A: If you have stakater/Reloader installed, this annotation 
+    # tells Reloader to do a rolling restart when 'gcp-sync-topics' changes!
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gcp-sync-test
+  template:
+    metadata:
+      labels:
+        app: gcp-sync-test
+    spec:
+      containers:
+      - name: sync-app
+        image: gcp-sync-app:latest
+        imagePullPolicy: Never # if loaded to local minikube/kind, or change to ECR repo
+        env:
+        - name: CONFIG_PATH
+          value: "/app/config/topics.json"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+      volumes:
+      - name: config-volume
+        configMap:
+          name: gcp-sync-topics
