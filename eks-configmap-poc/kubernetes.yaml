@@ -1,0 +1,63 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gcp-sync-streaming-configmap
+  namespace: data-ingestion
+data:
+  topics.json: |
+    {
+      "topics": [
+        "projects/poc-project/subscriptions/order-stream"
+      ]
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-sync-streaming-deployment
+  namespace: data-ingestion
+  annotations:
+    # -------------------------------------------------------------------
+    # IMPORTANT: The core of the POC. 
+    # If the Stakater Reloader helm chart is installed on your EKS cluster,
+    # it looks for this annotation. If this exists, Reloader handles the
+    # Rolling Restart when `gcp-sync-streaming-configmap` gets patched.
+    # -------------------------------------------------------------------
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1 # KEDA will handle scaling this up later
+  selector:
+    matchLabels:
+      app: gcp-sync-poc
+  template:
+    metadata:
+      labels:
+        app: gcp-sync-poc
+    spec:
+      containers:
+      - name: sync-poc-container
+        # -------------------------------------------------------------------
+        # Build and push the Dockerfile in this directory to your ECR repo 
+        # and replace this image tag.
+        # -------------------------------------------------------------------
+        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/gcp-sync-poc:latest
+        imagePullPolicy: Always
+        env:
+        - name: CONFIG_PATH
+          value: "/app/config/topics.json"
+        
+        # -------------------------------------------------------------------
+        # This tells Kubernetes to turn the ConfigMap payload into a volume
+        # -------------------------------------------------------------------
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+          
+      volumes:
+      - name: config-volume
+        configMap:
+          # This must match the name of the ConfigMap above
+          name: gcp-sync-streaming-configmap
