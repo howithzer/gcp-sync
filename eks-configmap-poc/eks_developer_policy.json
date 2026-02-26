@@ -1,0 +1,42 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "EKSClusterDiscovery",
+            "Effect": "Allow",
+            "Action": [
+                "eks:ListClusters",
+                "eks:DescribeCluster"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "EKSApiAccess",
+            "Effect": "Allow",
+            "Action": [
+                "eks:AccessKubernetesApi"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ECRRepositoryPush",
+            "Effect": "Allow",
+            "Action": [
+                "ecr:GetAuthorizationToken",
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:GetRepositoryPolicy",
+                "ecr:DescribeRepositories",
+                "ecr:ListImages",
+                "ecr:DescribeImages",
+                "ecr:BatchGetImage",
+                "ecr:InitiateLayerUpload",
+                "ecr:UploadLayerPart",
+                "ecr:CompleteLayerUpload",
+                "ecr:PutImage",
+                "ecr:CreateRepository"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

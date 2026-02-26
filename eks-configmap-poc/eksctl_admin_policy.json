@@ -1,0 +1,21 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "EKSCreationAdmin",
+            "Effect": "Allow",
+            "Action": [
+                "eks:*",
+                "ec2:*",
+                "iam:*",
+                "cloudformation:*",
+                "autoscaling:*",
+                "ssm:*",
+                "kms:*",
+                "elasticloadbalancing:*",
+                "ecr:*"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
