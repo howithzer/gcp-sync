@@ -42,7 +42,7 @@ spec:
         # Build and push the Dockerfile in this directory to your ECR repo 
         # and replace this image tag.
         # -------------------------------------------------------------------
-        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/gcp-sync-poc:latest
+        image: 487500748616.dkr.ecr.us-east-1.amazonaws.com/gcp-sync-poc:latest
         imagePullPolicy: Always
         env:
         - name: CONFIG_PATH
