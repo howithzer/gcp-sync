@@ -25,11 +25,23 @@ def get_eks_token(cluster_name):
         EKS_REGION, 'sts', 'v4',
         session.get_credentials(), session.events
     )
-    url = signer.generate_presigned_url(
-        {'Action': 'GetCallerIdentity', 'Version': '2011-06-15'},
-        region_name=EKS_REGION, expires_in=60, operation_name=''
+    
+    params = {
+        'method': 'GET',
+        'url': f'https://sts.{EKS_REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15',
+        'body': {},
+        'headers': {'x-k8s-aws-id': cluster_name},
+        'context': {}
+    }
+    
+    signed_url = signer.generate_presigned_url(
+        params,
+        region_name=EKS_REGION,
+        expires_in=60,
+        operation_name=''
     )
-    return 'k8s-aws-v1.' + base64.urlsafe_b64encode(url.encode('utf-8')).decode('utf-8').rstrip('=')
+    
+    return 'k8s-aws-v1.' + base64.urlsafe_b64encode(signed_url.encode('utf-8')).decode('utf-8').rstrip('=')
 
 def get_eks_cluster_info(cluster_name):
     """Retrieves the EKS Endpoint URL and base64 CA Certificate."""
