@@ -1,0 +1,26 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gcp-keda-auth-secret
+  namespace: default
+type: Opaque
+data:
+  # -------------------------------------------------------------------
+  # IMPORTANT: Replace this value with the base64-encoded contents of 
+  # your GCP Service Account JSON key before applying!
+  # Use: base64 -i my-gcp-key.json | tr -d '\n'
+  # -------------------------------------------------------------------
+  GoogleApplicationCredentials: <BASE64_KEY_HERE>
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: gcp-keda-trigger-auth
+  namespace: default
+spec:
+  secretTargetRef:
+    - parameter: GoogleApplicationCredentials
+      name: gcp-keda-auth-secret
+      key: GoogleApplicationCredentials

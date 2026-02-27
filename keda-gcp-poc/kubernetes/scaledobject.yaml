@@ -1,0 +1,40 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: gcp-keda-poc-scaler
+  namespace: default
+spec:
+  # Instruct KEDA to scale the deployment we just created
+  scaleTargetRef:
+    name: gcp-keda-poc-consumer
+    
+  # How often KEDA queries the GCP Metrics API (in seconds)
+  pollingInterval: 10 
+  
+  # How long KEDA waits (in seconds) after the queue hits 0 before killing all pods
+  cooldownPeriod: 60 
+  
+  # -------------------------------------------------------------------
+  # KEDA MAGIC: The absolute bounds of your scale out
+  # If the publisher sends 1,000,000 messages, KEDA will stop at 20 pods
+  # -------------------------------------------------------------------
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  
+  triggers:
+    - type: gcp-pubsub
+      metadata:
+        # The specific GCP Subscription KEDA tracks num_undelivered_messages for
+        subscriptionName: "projects/poc-project/subscriptions/keda-poc-sub"
+        
+        # -------------------------------------------------------------------
+        # THE KEDA ALGORITHM: Total Backlog / subscriptionSize = Replica Count
+        # Since our pod sleeps 1 second per message, we set this to 50.
+        # This tells KEDA: "If there are 50 messages waiting, spin up 1 pod.
+        # If there are 1,000 messages waiting, spin up 20 pods."
+        # -------------------------------------------------------------------
+        subscriptionSize: "50" 
+        
+      # Link KEDA to the Secret we provisioned so it can hit the GCP Metrics API 
+      authenticationRef:
+        name: gcp-keda-trigger-auth
