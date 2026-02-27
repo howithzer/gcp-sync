@@ -20,7 +20,7 @@ spec:
       containers:
       - name: poc-consumer
         # Build the python app in ../consumer/Dockerfile and push to your ECR
-        image: <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/keda-poc-worker:latest
+        image: 487500748616.dkr.ecr.us-east-1.amazonaws.com/keda-poc-worker:latest
         imagePullPolicy: Always
         env:
           - name: GCP_PROJECT_ID
