@@ -24,7 +24,7 @@ spec:
         imagePullPolicy: Always
         env:
           - name: GCP_PROJECT_ID
-            value: "poc-project"
+            value: "wired-sign-858"
           - name: GCP_SUBSCRIPTION_ID
             value: "keda-poc-sub"
           

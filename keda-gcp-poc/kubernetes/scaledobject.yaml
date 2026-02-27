@@ -25,7 +25,7 @@ spec:
     - type: gcp-pubsub
       metadata:
         # The specific GCP Subscription KEDA tracks num_undelivered_messages for
-        subscriptionName: "projects/poc-project/subscriptions/keda-poc-sub"
+        subscriptionName: "projects/wired-sign-858/subscriptions/keda-poc-sub"
         
         # -------------------------------------------------------------------
         # THE KEDA ALGORITHM: Total Backlog / subscriptionSize = Replica Count
