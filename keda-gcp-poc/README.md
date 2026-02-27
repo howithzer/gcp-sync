@@ -30,10 +30,19 @@ This directory contains the code and Kubernetes manifests needed to test KEDA (K
 
 ### Phase 2: Deployment
 
-Run these from your AWS CloudShell connected to the EKS cluster:
+Run these from your AWS CloudShell connected to the EKS cluster. AWS CloudShell does not have `helm` installed by default.
 
-1. **Install KEDA on EKS (if not already installed)**:
+**Option A: Install KEDA via Raw YAML (Easiest)**
 ```bash
+kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.16.1/keda-2.16.1.yaml
+```
+
+**Option B: Install Helm on CloudShell and deploy chart**
+```bash
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+
 helm repo add kedacore https://kedacore.github.io/charts
 helm repo update
 helm install keda kedacore/keda --namespace keda --create-namespace
