@@ -30,7 +30,7 @@ spec:
           
           # Inject the same GCP Key into the pod so the python SDK can pull messages
           - name: GOOGLE_APPLICATION_CREDENTIALS
-            value: "/var/secrets/google/key.json"
+            value: "/var/secrets/google/GoogleApplicationCredentials"
             
         volumeMounts:
         - name: gcp-key-volume
