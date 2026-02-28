@@ -1,0 +1,27 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: gcp-multi-topic-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: gcp-multi-topic-consumer
+    
+  pollingInterval: 10 
+  cooldownPeriod: 60 
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  
+  # -------------------------------------------------------------------
+  # KEDA triggers block.
+  # This array starts with just one baseline topic.
+  # Our Python Lambda Orchestrator script will dynamically inject 
+  # additional triggers into this list via the EKS API!
+  # -------------------------------------------------------------------
+  triggers:
+    - type: gcp-pubsub
+      metadata:
+        subscriptionName: "projects/wired-sign-858/subscriptions/keda-poc-sub"
+        subscriptionSize: "50" 
+      authenticationRef:
+        name: gcp-keda-trigger-auth

@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-multi-topic-consumer
+  namespace: default
+  annotations:
+    # -------------------------------------------------------------------
+    # STAKATER MAGIC: Any time the ConfigMap payload changes,
+    # initiate a zero-downtime rolling restart of these pods!
+    # -------------------------------------------------------------------
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 0 
+  selector:
+    matchLabels:
+      app: multi-topic-consumer
+  template:
+    metadata:
+      labels:
+        app: multi-topic-consumer
+    spec:
+      containers:
+      - name: consumer
+        # Build the python app in ../consumer/Dockerfile and push to your ECR
+        image: 487500748616.dkr.ecr.us-east-1.amazonaws.com/keda-multi-topic-worker:latest
+        imagePullPolicy: Always
+        env:
+          - name: GCP_PROJECT_ID
+            value: "wired-sign-858"
+          
+          # Inject the GCP Key into the pod so the python SDK can pull messages
+          - name: GOOGLE_APPLICATION_CREDENTIALS
+            value: "/var/secrets/google/GoogleApplicationCredentials"
+            
+          # The path the Python app reads to know which streams to open
+          - name: CONFIG_PATH
+            value: "/app/config/topics.json"
+            
+        volumeMounts:
+        - name: gcp-key-volume
+          mountPath: /var/secrets/google
+          readOnly: true
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+          
+      volumes:
+      - name: gcp-key-volume
+        secret:
+          secretName: gcp-keda-auth-secret
+      - name: config-volume
+        configMap:
+          name: gcp-multi-topic-configmap
