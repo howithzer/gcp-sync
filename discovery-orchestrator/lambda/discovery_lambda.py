@@ -119,25 +119,37 @@ def calculate_drift(discovered_subs):
         
     query = f"SELECT subscription_name FROM {ATHENA_DATABASE}.{ATHENA_TABLE}"
     try:
-        response = execute_athena_query(query)
-        execution_id = response['QueryExecutionId']
+        # Start the query ourselves to capture the execution_id from the INITIAL response
+        print(f"Drift check: querying {ATHENA_DATABASE}.{ATHENA_TABLE}...")
+        start_resp = athena_client.start_query_execution(
+            QueryString=query,
+            QueryExecutionContext={'Database': ATHENA_DATABASE},
+            ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_LOC}
+        )
+        execution_id = start_resp['QueryExecutionId']
         
-        # Paginate through results
+        # Wait for it to complete
+        while True:
+            status_resp = athena_client.get_query_execution(QueryExecutionId=execution_id)
+            state = status_resp['QueryExecution']['Status']['State']
+            if state == 'SUCCEEDED':
+                break
+            if state in ['FAILED', 'CANCELLED']:
+                raise Exception(f"Drift query failed: {state}")
+            time.sleep(1)
+        
+        # Read results
         known_subs = set()
         results = athena_client.get_query_results(QueryExecutionId=execution_id)
-        
-        # Skip the header row
-        for row in results['ResultSet']['Rows'][1:]:
+        for row in results['ResultSet']['Rows'][1:]:  # skip header
             known_subs.add(row['Data'][0]['VarCharValue'])
             
-        # Calculate the delta
         new_subs = [sub for sub in discovered_subs if sub not in known_subs]
-        print(f"Drift Analysis complete. {len(known_subs)} known, {len(new_subs)} net-new.")
+        print(f"Drift: {len(known_subs)} already registered, {len(new_subs)} net-new.")
         return new_subs
         
     except Exception as e:
-        print(f"Failed to calculate drift (table might be empty): {e}")
-        # If the query fails, assume all discovered topics are net-new
+        print(f"Failed to calculate drift (treating all as new): {e}")
         return discovered_subs
 
 def lambda_handler(event, context):

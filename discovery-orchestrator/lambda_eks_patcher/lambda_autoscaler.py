@@ -19,6 +19,7 @@ EKS_REGION = os.getenv("EKS_REGION", "us-east-1")
 NAMESPACE = os.getenv("NAMESPACE", "default")
 CONFIGMAP_NAME = "gcp-multi-topic-configmap"
 SCALEDOBJECT_NAME = "gcp-multi-topic-scaler"
+DEPLOYMENT_NAME = "gcp-multi-topic-consumer"
 
 def get_eks_token(cluster_name):
     """Generates AWS STS token for authenticating against EKS."""
@@ -100,17 +101,42 @@ def patch_pod_configmap(endpoint, ca_data, token, topics):
     """
     Updates the ConfigMap. Core Kubernetes objects support strategic-merge-patch+json,
     which is proven working in the eks-configmap-poc.
-    Stakater Reloader (if installed) will auto-restart pods on ConfigMap change.
-    If not using Reloader, the Lambda triggers a rolling restart directly after this.
     """
     payload = {"data": {"topics.json": json.dumps({"topics": topics})}}
     path = f"/api/v1/namespaces/{NAMESPACE}/configmaps/{CONFIGMAP_NAME}"
     
     print(f"--> [STEP 2] Patching ConfigMap '{CONFIGMAP_NAME}' with {len(topics)} topics...")
-    # Core K8s objects (ConfigMap) support strategic-merge-patch — same as the proven POC
     call_eks_api(endpoint, ca_data, token, path, "PATCH", payload,
                  content_type="application/strategic-merge-patch+json")
-    print("--> [SUCCESS] ConfigMap patched. Pods will reload their config.")
+    print("--> [SUCCESS] ConfigMap patched.")
+
+def restart_deployment(endpoint, ca_data, token):
+    """
+    Triggers a rolling restart of the consumer Deployment — equivalent to:
+      kubectl rollout restart deployment/gcp-multi-topic-consumer
+    Patches the pod template annotation with the current UTC timestamp.
+    Kubernetes detects the change and cycles all pods with the new ConfigMap content.
+    No Stakater Reloader required!
+    """
+    import datetime
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": now
+                    }
+                }
+            }
+        }
+    }
+    path = f"/apis/apps/v1/namespaces/{NAMESPACE}/deployments/{DEPLOYMENT_NAME}"
+    
+    print(f"--> [STEP 3] Triggering rolling restart of Deployment '{DEPLOYMENT_NAME}'...")
+    call_eks_api(endpoint, ca_data, token, path, "PATCH", payload,
+                 content_type="application/strategic-merge-patch+json")
+    print("--> [SUCCESS] Rolling restart triggered. Pods will now mount the new topic config.")
 
 def lambda_handler(event, context):
     print("===================================================================")
@@ -139,11 +165,14 @@ def lambda_handler(event, context):
     # We enforce strict ordering. If KEDA fails to patch, the script crashes, 
     # preventing the configmap from being updated with orphaned topics.
     try:
-        # 1. Update the Autoscaler
+        # 1. Patch KEDA ScaledObject so KEDA monitors the right queues
         patch_keda_autoscaler(endpoint, ca_data, token, dynamic_topic_subscriptions)
         
-        # 2. Update the App Config
+        # 2. Patch the ConfigMap so pods know which topics to consume
         patch_pod_configmap(endpoint, ca_data, token, dynamic_topic_subscriptions)
+        
+        # 3. Trigger rolling restart so pods pick up the new ConfigMap immediately
+        restart_deployment(endpoint, ca_data, token)
         
         return {
             "statusCode": 200, 
