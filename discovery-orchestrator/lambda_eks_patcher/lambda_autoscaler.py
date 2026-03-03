@@ -49,15 +49,13 @@ def get_eks_cluster_info(cluster_name):
     cluster = client.describe_cluster(name=cluster_name)['cluster']
     return cluster['endpoint'], cluster['certificateAuthority']['data']
 
-def call_eks_api(endpoint, ca_data, token, path, method, payload):
+def call_eks_api(endpoint, ca_data, token, path, method, payload, content_type="application/merge-patch+json"):
     """Executes the REST HTTP request to the EKS Control Plane."""
     url = f"{endpoint}{path}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
-        # strategic-merge-patch is required for KEDA CRD — it merges arrays instead of replacing them.
-        # Using application/merge-patch+json would WIPE the triggers[] array on every call.
-        "Content-Type": "application/strategic-merge-patch+json"
+        "Content-Type": content_type
     }
     
     data = json.dumps(payload).encode('utf-8')
@@ -72,7 +70,9 @@ def call_eks_api(endpoint, ca_data, token, path, method, payload):
 def patch_keda_autoscaler(endpoint, ca_data, token, topics):
     """
     Dynamically generates the KEDA Target Triggers list and patches the CRD.
-    Because KEDA needs a specific block for every topic, we build it in a loop!
+    We always send the FULL triggers array — merge-patch replaces the array entirely,
+    which is exactly what we want (rebuild from the current discovered topic list).
+    KEDA CRDs only support: merge-patch+json, json-patch+json, apply-patchyaml.
     """
     triggers = []
     for topic in topics:
@@ -88,22 +88,29 @@ def patch_keda_autoscaler(endpoint, ca_data, token, topics):
         })
         
     payload = {"spec": {"triggers": triggers}}
-    # Note: When hitting the Control Plane directly, we must include the full /apis route
     path = f"/apis/keda.sh/v1alpha1/namespaces/{NAMESPACE}/scaledobjects/{SCALEDOBJECT_NAME}"
     
-    print(f"--> [STEP 1] Patching KEDA ScaledObject with {len(triggers)} discrete triggers...")
-    call_eks_api(endpoint, ca_data, token, path, "PATCH", payload)
-    print("--> [SUCCESS] KEDA Autoscaler successfully updated. It is now watching the new queue depths.")
+    print(f"--> [STEP 1] Patching KEDA ScaledObject with {len(triggers)} triggers...")
+    # KEDA CRDs accept merge-patch+json (not strategic-merge-patch)
+    call_eks_api(endpoint, ca_data, token, path, "PATCH", payload,
+                 content_type="application/merge-patch+json")
+    print("--> [SUCCESS] KEDA Autoscaler updated.")
 
 def patch_pod_configmap(endpoint, ca_data, token, topics):
-    """Updates the ConfigMap causing Stakater-Reloader to transparently restart the apps."""
+    """
+    Updates the ConfigMap. Core Kubernetes objects support strategic-merge-patch+json,
+    which is proven working in the eks-configmap-poc.
+    Stakater Reloader (if installed) will auto-restart pods on ConfigMap change.
+    If not using Reloader, the Lambda triggers a rolling restart directly after this.
+    """
     payload = {"data": {"topics.json": json.dumps({"topics": topics})}}
-    # ConfigMaps are part of the core API, which is under /api/v1
     path = f"/api/v1/namespaces/{NAMESPACE}/configmaps/{CONFIGMAP_NAME}"
     
-    print(f"--> [STEP 2] Patching ConfigMap with {len(topics)} topics...")
-    call_eks_api(endpoint, ca_data, token, path, "PATCH", payload)
-    print("--> [SUCCESS] ConfigMap Patched. The EKS Pods are now rolling restarts to mount the new config.")
+    print(f"--> [STEP 2] Patching ConfigMap '{CONFIGMAP_NAME}' with {len(topics)} topics...")
+    # Core K8s objects (ConfigMap) support strategic-merge-patch — same as the proven POC
+    call_eks_api(endpoint, ca_data, token, path, "PATCH", payload,
+                 content_type="application/strategic-merge-patch+json")
+    print("--> [SUCCESS] ConfigMap patched. Pods will reload their config.")
 
 def lambda_handler(event, context):
     print("===================================================================")
