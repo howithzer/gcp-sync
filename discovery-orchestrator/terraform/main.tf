@@ -92,9 +92,29 @@ data "archive_file" "eks_patcher_lambda_zip" {
 resource "aws_lambda_function" "gcp_eks_patcher" {
   filename         = data.archive_file.eks_patcher_lambda_zip.output_path
   source_code_hash = data.archive_file.eks_patcher_lambda_zip.output_base64sha256
-  function_name    = "gcp-sync-eks-patch-orchestrator"
+  function_name    = "gcp-sync-eks-keda-patcher"
   role             = aws_iam_role.lambda_exec.arn
-  handler          = "lambda_autoscaler.lambda_handler"
+  handler          = "lambda_autoscaler.keda_handler"
+  runtime          = "python3.9"
+  timeout          = 60
+
+  environment {
+    variables = {
+      EKS_CLUSTER_NAME = "gcp-sync-poc-test"
+      EKS_REGION       = "us-east-1"
+      NAMESPACE        = "default"
+    }
+  }
+}
+
+# Second Lambda entry point — same zip, different handler
+# Invoked AFTER a 15s Wait state so KEDA has time to reconcile
+resource "aws_lambda_function" "gcp_configmap_patcher" {
+  filename         = data.archive_file.eks_patcher_lambda_zip.output_path
+  source_code_hash = data.archive_file.eks_patcher_lambda_zip.output_base64sha256
+  function_name    = "gcp-sync-eks-configmap-patcher"
+  role             = aws_iam_role.lambda_exec.arn
+  handler          = "lambda_autoscaler.configmap_handler"
   runtime          = "python3.9"
   timeout          = 60
 
@@ -171,6 +191,29 @@ resource "aws_sfn_state_machine" "onboarding_orchestrator" {
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${aws_lambda_function.gcp_eks_patcher.arn}",
+        "Payload.$": "$.Payload"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [ "States.ALL" ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "WaitForKEDAReconcile"
+    },
+    "WaitForKEDAReconcile": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Comment": "Give KEDA 15s to process the new ScaledObject before restarting pods",
+      "Next": "PatchConfigMap"
+    },
+    "PatchConfigMap": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${aws_lambda_function.gcp_configmap_patcher.arn}",
         "Payload.$": "$.Payload"
       },
       "Retry": [

@@ -138,56 +138,67 @@ def restart_deployment(endpoint, ca_data, token):
                  content_type="application/strategic-merge-patch+json")
     print("--> [SUCCESS] Rolling restart triggered. Pods will now mount the new topic config.")
 
-def lambda_handler(event, context):
-    print("===================================================================")
-    print(f"Starting Multi-Topic KEDA Patcher -> Cluster: {EKS_CLUSTER_NAME}")
-    print("===================================================================")
-    
-    # The Step Function wraps Lambda output under a 'Payload' key when passing between states.
-    # Defensively unwrap it so this Lambda works whether invoked directly or via Step Functions.
-    effective_event = event.get('Payload', event)
-    
-    if 'subscriptions' not in effective_event or not effective_event['subscriptions']:
-        print("No subscriptions passed to autoscaler. Exiting.")
-        return {"status": "SKIPPED", "patched_topics": 0}
-        
-    dynamic_topic_subscriptions = effective_event['subscriptions']
-    print(f"Received {len(dynamic_topic_subscriptions)} subcriptions to patch against EKS.")
-    
-    try:
-        endpoint, ca_data = get_eks_cluster_info(EKS_CLUSTER_NAME)
-        token = get_eks_token(EKS_CLUSTER_NAME)
-    except Exception as e:
-        print(f"[FATAL] Failed to authenticate to EKS: {e}")
-        return {"statusCode": 500, "body": str(e)}
 
-    # DEFENSIVE TRANSACTION LOGIC
-    # We enforce strict ordering. If KEDA fails to patch, the script crashes, 
-    # preventing the configmap from being updated with orphaned topics.
+def _get_subscriptions(event):
+    """Unwraps the Step Function Payload envelope and returns the subscriptions list."""
+    effective = event.get('Payload', event)
+    return effective.get('subscriptions', [])
+
+def _connect_eks():
+    """Authenticates to EKS and returns (endpoint, ca_data, token)."""
+    endpoint, ca_data = get_eks_cluster_info(EKS_CLUSTER_NAME)
+    token = get_eks_token(EKS_CLUSTER_NAME)
+    return endpoint, ca_data, token
+
+# ===========================================================================
+# Handler 1: keda_handler
+# Registered as: lambda_autoscaler.keda_handler
+# Step Function State: PatchEKSKEDA
+# Only patches the KEDA ScaledObject. Passes subscriptions forward so the
+# Step Function Wait state can relay them to configmap_handler.
+# ===========================================================================
+def keda_handler(event, context):
+    print("=== [Stage 2a] KEDA ScaledObject Patcher ===")
+    subscriptions = _get_subscriptions(event)
+    if not subscriptions:
+        print("No subscriptions received. Skipping.")
+        return {"status": "SKIPPED", "subscriptions": []}
     try:
-        # 1. Patch KEDA ScaledObject so KEDA monitors the right queues
-        patch_keda_autoscaler(endpoint, ca_data, token, dynamic_topic_subscriptions)
-        
-        # 2. Patch the ConfigMap so pods know which topics to consume
-        patch_pod_configmap(endpoint, ca_data, token, dynamic_topic_subscriptions)
-        
-        # 3. Trigger rolling restart so pods pick up the new ConfigMap immediately
-        restart_deployment(endpoint, ca_data, token)
-        
-        return {
-            "statusCode": 200, 
-            "patched_topics": len(dynamic_topic_subscriptions),
-            "status": "SUCCESS"
-        }
-        
+        endpoint, ca_data, token = _connect_eks()
+        patch_keda_autoscaler(endpoint, ca_data, token, subscriptions)
+        # Pass subscriptions forward — Step Function relays this to configmap_handler after 15s wait
+        return {"status": "SUCCESS", "subscriptions": subscriptions}
     except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8')
-        print(f"\n[FATAL] EKS API Transaction Aborted! -> HTTP {e.code}: {body}")
-        raise Exception(f"EKS PATCH FAILED: {body}")
-        
-    except Exception as e:
-        print(f"\n[FATAL] Unexpected error aborted transaction: {e}")
-        raise Exception(f"EKS PATCH FAILED: {e}")
+        raise Exception(f"KEDA PATCH FAILED: {e.read().decode('utf-8')}")
+
+# ===========================================================================
+# Handler 2: configmap_handler
+# Registered as: lambda_autoscaler.configmap_handler
+# Step Function State: PatchConfigMap (invoked AFTER a 15s Wait state)
+# KEDA has had time to reconcile the new ScaledObject before pods restart.
+# ===========================================================================
+def configmap_handler(event, context):
+    print("=== [Stage 2b] ConfigMap Patcher + Rolling Restart ===")
+    subscriptions = _get_subscriptions(event)
+    if not subscriptions:
+        print("No subscriptions received. Skipping.")
+        return {"status": "SKIPPED"}
+    try:
+        endpoint, ca_data, token = _connect_eks()
+        patch_pod_configmap(endpoint, ca_data, token, subscriptions)
+        restart_deployment(endpoint, ca_data, token)
+        return {"status": "SUCCESS", "patched_topics": len(subscriptions)}
+    except urllib.error.HTTPError as e:
+        raise Exception(f"CONFIGMAP PATCH FAILED: {e.read().decode('utf-8')}")
+
+# ===========================================================================
+# Legacy combined handler — kept for local dry-run testing only
+# ===========================================================================
+def lambda_handler(event, context):
+    result = keda_handler(event, context)
+    if result.get('status') != 'SKIPPED':
+        configmap_handler(event, context)
+    return result
 
 if __name__ == "__main__":
     lambda_handler({}, None)
