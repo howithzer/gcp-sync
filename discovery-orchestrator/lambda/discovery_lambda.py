@@ -68,22 +68,24 @@ def ensure_iceberg_table_exists():
     """
     execute_athena_query(ddl)
 
-def upsert_subscriptions_to_iceberg(subscriptions):
+def upsert_subscriptions_to_iceberg(subscriptions, status='PENDING'):
     """
-    Constructs a MERGE INTO statement to upsert the discovered subscriptions 
-    into the Iceberg table. Unseen subscriptions shouldn't be deleted immediately, 
-    but for this POC we will simply update the last_seen_ts for all discovered ones.
+    Upserts discovered subscriptions into the Iceberg registry.
+    
+    Status lifecycle:
+      PENDING  → Topic discovered, waiting for EKS patching (set on first INSERT)
+      ACTIVE   → EKS has been patched; KEDA and ConfigMap are up to date
+    
+    New topics are inserted as PENDING. Known topics update their last_seen_ts
+    but stay ACTIVE (they are already patched).
     """
     if not subscriptions:
         print("No subscriptions discovered. Skipping UPSERT.")
         return
 
-    # Build an inline values table query to act as the source for the MERGE
-    # Format: ( 'projects/.../sub-1', current_timestamp, 'ACTIVE', 'baseline' )
     values_raw = []
     for sub in subscriptions:
-        # Note: Athena Iceberg requires strict timestamp formats, current_timestamp handles this
-        values_raw.append(f"('{sub}', current_timestamp, 'ACTIVE', 'baseline')")
+        values_raw.append(f"('{sub}', current_timestamp, '{status}', 'baseline')")
         
     values_str = ",\n        ".join(values_raw)
     
@@ -99,15 +101,17 @@ def upsert_subscriptions_to_iceberg(subscriptions):
     WHEN MATCHED THEN
         UPDATE SET 
             last_seen_ts = source.seen_ts,
-            status = 'ACTIVE'
+            status = 'ACTIVE'      -- Already known and patched: mark ACTIVE
     WHEN NOT MATCHED THEN
         INSERT (subscription_name, last_seen_ts, status, usage_group)
-        VALUES (source.sub_name, source.seen_ts, source.stat, source.u_group);
+        VALUES (source.sub_name, source.seen_ts, 'PENDING', source.u_group);
+                                   -- Net-new topic: mark PENDING until EKS patched
     """
     
     print("Executing MERGE UPSERT into Iceberg...")
     execute_athena_query(merge_query)
-    print("Successfully Upserted GCP topology into Iceberg Registry.")
+    print("Successfully upserted GCP topology into Iceberg Registry.")
+
 
 def calculate_drift(discovered_subs):
     """

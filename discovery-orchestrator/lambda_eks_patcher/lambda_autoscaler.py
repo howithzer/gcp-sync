@@ -14,12 +14,19 @@ from botocore.signers import RequestSigner
 # 2. Updates the Pod ConfigMap so the pods consume the topics.
 # -------------------------------------------------------------------
 
+import time
+
 EKS_CLUSTER_NAME = os.getenv("EKS_CLUSTER_NAME", "gcp-sync-poc-test")
 EKS_REGION = os.getenv("EKS_REGION", "us-east-1")
 NAMESPACE = os.getenv("NAMESPACE", "default")
 CONFIGMAP_NAME = "gcp-multi-topic-configmap"
 SCALEDOBJECT_NAME = "gcp-multi-topic-scaler"
 DEPLOYMENT_NAME = "gcp-multi-topic-consumer"
+
+# Athena — used to flip topic status to ACTIVE after successful EKS patching
+ATHENA_DATABASE  = os.getenv("ATHENA_DATABASE", "gcp_sync_db")
+ATHENA_TABLE     = os.getenv("ATHENA_TABLE", "subscription_registry")
+ATHENA_OUTPUT    = os.getenv("ATHENA_OUTPUT_LOC", "s3://YOUR-BUCKET/ddl/")
 
 def get_eks_token(cluster_name):
     """Generates AWS STS token for authenticating against EKS."""
@@ -150,6 +157,36 @@ def _connect_eks():
     token = get_eks_token(EKS_CLUSTER_NAME)
     return endpoint, ca_data, token
 
+def mark_topics_active(subscriptions):
+    """
+    Flips the Iceberg registry status from PENDING -> ACTIVE after EKS is fully patched.
+    This gives ops a live queryable audit trail:
+      SELECT * FROM gcp_sync_db.subscription_registry WHERE status = 'PENDING'
+    """
+    if not subscriptions:
+        return
+    athena = boto3.client('athena', region_name=EKS_REGION)
+    names = ", ".join([f"'{s}'" for s in subscriptions])
+    query = f"""
+    UPDATE {ATHENA_DATABASE}.{ATHENA_TABLE}
+    SET status = 'ACTIVE', last_seen_ts = current_timestamp
+    WHERE subscription_name IN ({names})
+      AND status = 'PENDING'
+    """
+    resp = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={'Database': ATHENA_DATABASE},
+        ResultConfiguration={'OutputLocation': ATHENA_OUTPUT}
+    )
+    exec_id = resp['QueryExecutionId']
+    # Wait for completion
+    while True:
+        state = athena.get_query_execution(QueryExecutionId=exec_id)['QueryExecution']['Status']['State']
+        if state in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+            break
+        time.sleep(1)
+    print(f"--> [STATUS] Marked {len(subscriptions)} topics as ACTIVE in Iceberg registry (state={state}).")
+
 # ===========================================================================
 # Handler 1: keda_handler
 # Registered as: lambda_autoscaler.keda_handler
@@ -187,9 +224,12 @@ def configmap_handler(event, context):
         endpoint, ca_data, token = _connect_eks()
         patch_pod_configmap(endpoint, ca_data, token, subscriptions)
         restart_deployment(endpoint, ca_data, token)
+        # Flip Iceberg registry status PENDING -> ACTIVE now that EKS is fully patched
+        mark_topics_active(subscriptions)
         return {"status": "SUCCESS", "patched_topics": len(subscriptions)}
     except urllib.error.HTTPError as e:
         raise Exception(f"CONFIGMAP PATCH FAILED: {e.read().decode('utf-8')}")
+
 
 # ===========================================================================
 # Legacy combined handler — kept for local dry-run testing only

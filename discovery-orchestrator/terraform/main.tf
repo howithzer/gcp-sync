@@ -120,9 +120,12 @@ resource "aws_lambda_function" "gcp_configmap_patcher" {
 
   environment {
     variables = {
-      EKS_CLUSTER_NAME = "gcp-sync-poc-test"
-      EKS_REGION       = "us-east-1"
-      NAMESPACE        = "default"
+      EKS_CLUSTER_NAME  = "gcp-sync-poc-test"
+      EKS_REGION        = "us-east-1"
+      NAMESPACE         = "default"
+      ATHENA_DATABASE   = "gcp_sync_db"
+      ATHENA_TABLE      = "subscription_registry"
+      ATHENA_OUTPUT_LOC = "s3://${aws_s3_bucket.athena_results.bucket}/ddl/"
     }
   }
 }
@@ -248,4 +251,107 @@ resource "aws_cloudwatch_event_target" "step_function" {
   target_id = "TriggerGCPDiscoveryStepFunction"
   arn       = aws_sfn_state_machine.onboarding_orchestrator.arn
   role_arn  = aws_iam_role.eventbridge_exec.arn
+}
+
+# -----------------------------------------------------------------------------
+# 5. Alerting Stack: SNS + CloudWatch Alarm + EventBridge failure events
+# -----------------------------------------------------------------------------
+
+variable "alert_email" {
+  description = "Email address to receive pipeline failure alerts"
+  type        = string
+  default     = "ops-team@example.com"  # Override with: terraform apply -var="alert_email=you@example.com"
+}
+
+# SNS topic — single target for all pipeline alerts
+resource "aws_sns_topic" "pipeline_alerts" {
+  name = "gcp-sync-pipeline-alerts"
+}
+
+resource "aws_sns_topic_subscription" "alert_email" {
+  topic_arn = aws_sns_topic.pipeline_alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# --- Alert Path 1: EventBridge → SNS (immediate, event-driven) ---
+# Fires within seconds of any Step Function execution failure.
+# Covers: FAILED, TIMED_OUT, ABORTED states.
+resource "aws_cloudwatch_event_rule" "step_function_failure" {
+  name        = "gcp-sync-pipeline-failure"
+  description = "Routes Step Function failures to SNS immediately"
+  event_pattern = jsonencode({
+    source      = ["aws.states"]
+    detail-type = ["Step Functions Execution Status Change"]
+    detail = {
+      stateMachineArn = [aws_sfn_state_machine.onboarding_orchestrator.arn]
+      status          = ["FAILED", "TIMED_OUT", "ABORTED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "notify_on_failure" {
+  rule      = aws_cloudwatch_event_rule.step_function_failure.name
+  target_id = "SendFailureAlertToSNS"
+  arn       = aws_sns_topic.pipeline_alerts.arn
+
+  input_transformer {
+    input_paths = {
+      execution = "$.detail.executionArn"
+      status    = "$.detail.status"
+      reason    = "$.detail.cause"
+    }
+    input_template = "\"GCP Sync Pipeline FAILED\\nStatus: <status>\\nExecution: <execution>\\nReason: <reason>\""
+  }
+}
+
+# Allow EventBridge to publish to the SNS topic
+resource "aws_sns_topic_policy" "allow_eventbridge" {
+  arn = aws_sns_topic.pipeline_alerts.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sns:Publish"
+      Resource  = aws_sns_topic.pipeline_alerts.arn
+    }]
+  })
+}
+
+# --- Alert Path 2: CloudWatch Alarm → SNS (metric-based safety net) ---
+# Triggers if any Lambda errors accumulate even within a successful execution.
+resource "aws_cloudwatch_metric_alarm" "step_function_failures" {
+  alarm_name          = "gcp-sync-pipeline-executions-failed"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ExecutionsFailed"
+  namespace           = "AWS/States"
+  period              = 300  # 5-minute window
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "Fires when any GCP Sync Step Function execution fails"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    StateMachineArn = aws_sfn_state_machine.onboarding_orchestrator.arn
+  }
+
+  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
+  ok_actions    = [aws_sns_topic.pipeline_alerts.arn]  # Also notify when it recovers
+}
+
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  alarm_name          = "gcp-sync-lambda-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 3    # Allow up to 3 retries before alerting
+  alarm_description   = "Fires when Lambda errors exceed retry budget across all pipeline Lambdas"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.pipeline_alerts.arn]
 }
