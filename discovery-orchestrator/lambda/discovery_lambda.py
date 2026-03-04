@@ -36,10 +36,10 @@ def execute_athena_query(query_string):
         time.sleep(1)
 
 
-def athena_fetch_column(execution_id):
-    """Returns all values in the first column of the Athena result (skipping header row)."""
+def athena_fetch_column(execution_id, col_index=0):
+    """Returns all values in a specific column of the Athena result (skips header row)."""
     results = athena_client.get_query_results(QueryExecutionId=execution_id)
-    return [row['Data'][0]['VarCharValue'] for row in results['ResultSet']['Rows'][1:]]
+    return [row['Data'][col_index]['VarCharValue'] for row in results['ResultSet']['Rows'][1:]]
 
 
 # ---------------------------------------------------------------------------
@@ -47,14 +47,30 @@ def athena_fetch_column(execution_id):
 # ---------------------------------------------------------------------------
 
 def discover_gcp_subscriptions():
-    """Lists all Pub/Sub subscriptions currently live in the GCP project."""
+    """
+    Lists all Pub/Sub subscriptions in the GCP project.
+
+    Returns a list of dicts:
+      [
+        { "subscription": "projects/.../subscriptions/foo-sub",
+          "topic":        "projects/.../topics/foo-topic"   },
+        ...
+      ]
+
+    If a subscription's backing topic has been deleted, GCP sets topic="_deleted-topic_".
+    We capture this so we can auto-detect orphaned subscriptions without needing the
+    operator to manually delete the subscription.
+    """
     print(f"Discovering GCP Subscriptions in project: {GCP_PROJECT_ID}...")
     subscriber = pubsub_v1.SubscriberClient()
-    subs = [s.name for s in subscriber.list_subscriptions(
-        request={"project": f"projects/{GCP_PROJECT_ID}"}
-    )]
-    print(f"Found {len(subs)} subscriptions on GCP.")
-    return subs
+    result = []
+    for sub in subscriber.list_subscriptions(request={"project": f"projects/{GCP_PROJECT_ID}"}):
+        result.append({
+            "subscription": sub.name,
+            "topic": sub.topic   # "_deleted-topic_" when backing topic is gone
+        })
+    print(f"Found {len(result)} subscription(s) on GCP.")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +78,14 @@ def discover_gcp_subscriptions():
 # ---------------------------------------------------------------------------
 
 def ensure_iceberg_table_exists():
-    """Creates the Iceberg subscription_registry table if it does not exist."""
+    """
+    Creates the Iceberg subscription_registry table if it does not exist.
+    Includes topic_name so we can track which topic backs each subscription.
+    """
     ddl = f"""
     CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.{ATHENA_TABLE} (
         subscription_name string,
+        topic_name        string,
         last_seen_ts      timestamp,
         status            string,
         usage_group       string
@@ -80,23 +100,39 @@ def ensure_iceberg_table_exists():
     """
     execute_athena_query(ddl)
 
+    # Safe migration: add topic_name if table already existed without it
+    try:
+        execute_athena_query(
+            f"ALTER TABLE {ATHENA_DATABASE}.{ATHENA_TABLE} ADD COLUMNS (topic_name string)"
+        )
+        print("Migration: added topic_name column to existing table.")
+    except Exception as e:
+        if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+            pass  # Column already exists, safe to ignore
+        else:
+            print(f"ALTER TABLE note (non-fatal): {e}")
 
-def upsert_subscriptions_to_iceberg(gcp_subs):
+
+def upsert_subscriptions_to_iceberg(live_subs):
     """
-    MERGE all GCP-discovered subscriptions into the registry.
+    MERGE all currently-live GCP subscriptions into the registry.
+
+    live_subs: list of { "subscription": str, "topic": str }
 
     Rules:
-      WHEN MATCHED  → only update last_seen_ts.
-                       NEVER touch usage_group — that column is owned by ops.
-                       NEVER touch status if already ACTIVE — only reset REMOVED→PENDING.
+      WHEN MATCHED  → update last_seen_ts and topic_name only.
+                       NEVER touch usage_group (ops-owned).
+                       Restore status REMOVED→PENDING if topic reappears.
       WHEN NOT MATCHED → INSERT with usage_group='baseline', status='PENDING'.
-                          All new topics land in baseline; ops promotes them later.
     """
-    if not gcp_subs:
-        print("No GCP subscriptions discovered. Skipping upsert.")
+    if not live_subs:
+        print("No live GCP subscriptions. Skipping upsert.")
         return
 
-    values_str = ",\n        ".join([f"('{s}', current_timestamp)" for s in gcp_subs])
+    values_str = ",\n        ".join([
+        f"('{s['subscription']}', '{s['topic']}', current_timestamp)"
+        for s in live_subs
+    ])
 
     merge_query = f"""
     MERGE INTO {ATHENA_DATABASE}.{ATHENA_TABLE} target
@@ -104,47 +140,60 @@ def upsert_subscriptions_to_iceberg(gcp_subs):
         SELECT * FROM (
             VALUES
             {values_str}
-        ) AS t(sub_name, seen_ts)
+        ) AS t(sub_name, topic_nm, seen_ts)
     ) source
     ON target.subscription_name = source.sub_name
     WHEN MATCHED THEN
         UPDATE SET
+            topic_name   = source.topic_nm,
             last_seen_ts = source.seen_ts,
             status = CASE WHEN target.status = 'REMOVED' THEN 'PENDING' ELSE target.status END
     WHEN NOT MATCHED THEN
-        INSERT (subscription_name, last_seen_ts, status, usage_group)
-        VALUES (source.sub_name, source.seen_ts, 'PENDING', 'baseline')
+        INSERT (subscription_name, topic_name, last_seen_ts, status, usage_group)
+        VALUES (source.sub_name, source.topic_nm, source.seen_ts, 'PENDING', 'baseline')
     """
-    print("Executing MERGE UPSERT into Iceberg (usage_group is ops-owned, never overwritten)...")
+    print("Executing MERGE UPSERT (topic_name tracked, usage_group never overwritten)...")
     execute_athena_query(merge_query)
     print("MERGE complete.")
 
 
-def mark_removed_subscriptions(gcp_subs):
+def mark_removed_subscriptions(live_subs):
     """
-    Finds ACTIVE registry topics that are no longer in GCP and marks them REMOVED.
-    This is the negative drift path — handles topics deleted from GCP.
-    Returns the count of topics marked REMOVED.
+    Marks subscriptions as REMOVED in two cases:
+    1. Subscription deleted from GCP entirely (not in list_subscriptions results)
+    2. Subscription is orphaned — backing topic was deleted (topic = '_deleted-topic_')
+
+    Returns count of topics newly marked REMOVED.
     """
+    gcp_sub_names = set(s['subscription'] for s in live_subs)
+    orphaned      = set(s['subscription'] for s in live_subs if s['topic'] == '_deleted-topic_')
+
+    # Find subscriptions that exist in registry but are gone from GCP entirely
     exec_id = execute_athena_query(
         f"SELECT subscription_name FROM {ATHENA_DATABASE}.{ATHENA_TABLE} "
         f"WHERE status IN ('ACTIVE', 'PENDING')"
     )
     in_registry = set(athena_fetch_column(exec_id))
-    disappeared = in_registry - set(gcp_subs)
 
-    if not disappeared:
-        print("No removed subscriptions detected.")
+    deleted    = in_registry - gcp_sub_names   # completely gone from GCP
+    to_remove  = deleted | orphaned             # union: gone OR orphaned
+
+    if not to_remove:
+        print("No removed or orphaned subscriptions detected.")
         return 0
 
-    print(f"Marking {len(disappeared)} topic(s) REMOVED (deleted from GCP): {disappeared}")
-    names_csv = ", ".join([f"'{s}'" for s in disappeared])
+    if orphaned:
+        print(f"Orphaned subscriptions (topic deleted, sub still exists): {orphaned}")
+    if deleted:
+        print(f"Deleted subscriptions (gone from GCP entirely): {deleted}")
+
+    names_csv = ", ".join([f"'{s}'" for s in to_remove])
     execute_athena_query(
         f"""UPDATE {ATHENA_DATABASE}.{ATHENA_TABLE}
         SET status = 'REMOVED', last_seen_ts = current_timestamp
         WHERE subscription_name IN ({names_csv})"""
     )
-    return len(disappeared)
+    return len(to_remove)
 
 
 # ---------------------------------------------------------------------------
@@ -153,13 +202,9 @@ def mark_removed_subscriptions(gcp_subs):
 
 def get_group_subscriptions(group):
     """
-    Returns the current non-REMOVED subscriptions for this group.
-    This is the list used to rebuild KEDA triggers and ConfigMap.
-    REMOVED topics are excluded — the rebuild drops them automatically.
-
-    drift_count = len(result):
-      0  → group has no topics at all → skip K8s patching entirely
-      >0 → always rebuild (idempotent, ensures group stays in sync with registry)
+    Returns the current non-REMOVED subscription names for this group.
+    Used to rebuild the KEDA triggers array and ConfigMap.
+    drift_count = len(result): 0 = skip patching, >0 = always rebuild.
     """
     exec_id = execute_athena_query(
         f"""SELECT subscription_name FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
@@ -167,7 +212,7 @@ def get_group_subscriptions(group):
         AND status != 'REMOVED'"""
     )
     subs = athena_fetch_column(exec_id)
-    print(f"Group '{group}': {len(subs)} active subscription(s).")
+    print(f"Group '{group}': {len(subs)} subscription(s) for EKS patching.")
     return subs
 
 
@@ -177,52 +222,42 @@ def get_group_subscriptions(group):
 
 def lambda_handler(event, context):
     """
-    Entry point for the Step Function DiscoverGCPSubscriptions state.
+    Entry point. EventBridge passes {"group": "baseline"} / {"group": "group1"} etc.
 
-    EventBridge passes   {"group": "baseline"}  or  {"group": "group1"}  etc.
-    The group determines which K8s resources to patch; discovery is always global.
-
-    Output payload:
+    Output payload handed to the Step Function:
       {
         "status":        "SUCCESS",
         "group":         "baseline",
-        "total_gcp":     8,
-        "drift_count":   3,       ← topics in this group (0 = skip patching)
-        "removed":       0,
-        "subscriptions": [...]    ← topics for this group handed to EKS patcher
+        "total_gcp":     5,
+        "drift_count":   5,     ← 0 = skip K8s patching
+        "removed":       4,     ← topics marked REMOVED this run
+        "subscriptions": [...]  ← non-REMOVED topics for this group → EKS patcher
       }
     """
     print("=== Discovery Orchestrator: Phase 4 ===")
-
-    # Which group is this invocation responsible for?
     group = event.get('group', 'baseline')
     print(f"Invoked for group: '{group}'")
 
-    # Step 0: ensure registry table exists
+    # Step 0: ensure table (with topic_name column)
     ensure_iceberg_table_exists()
 
-    # Step 1: discover all current GCP subscriptions
+    # Step 1: discover all GCP subscriptions with their backing topic
     gcp_subs = discover_gcp_subscriptions()
 
-    # Step 2: global upsert — new topics land in baseline; usage_group never overwritten
+    # Step 2: global upsert — new topics land in baseline/PENDING, topic_name always refreshed
     upsert_subscriptions_to_iceberg(gcp_subs)
 
-    # Step 3: negative drift — mark topics deleted from GCP as REMOVED
+    # Step 3: mark deleted subs + orphaned subs (topic="_deleted-topic_") as REMOVED
     removed_count = mark_removed_subscriptions(gcp_subs)
 
-    # Step 4: get the current subscription list for THIS group (excludes REMOVED)
+    # Step 4: group-scoped query — what does THIS group's K8s infra need?
     group_subs = get_group_subscriptions(group)
-
-    # drift_count = number of topics in this group
-    # 0  → group is empty → Step Function will skip K8s patching
-    # >0 → always rebuild this group's KEDA/ConfigMap (idempotent)
-    drift_count = len(group_subs)
 
     return {
         "status":        "SUCCESS",
         "group":         group,
         "total_gcp":     len(gcp_subs),
-        "drift_count":   drift_count,
+        "drift_count":   len(group_subs),   # 0 = group empty, skip patching
         "removed":       removed_count,
         "subscriptions": group_subs
     }
@@ -230,6 +265,5 @@ def lambda_handler(event, context):
 
 if __name__ == "__main__":
     os.environ["AWS_PROFILE"] = "terraform-firehose"
-    # Test baseline group
     result = lambda_handler({"group": "baseline"}, None)
     print(result)
