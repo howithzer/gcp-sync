@@ -1,0 +1,19 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: gcp-scaler-baseline
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: gcp-consumer-baseline
+  pollingInterval: 10
+  cooldownPeriod:  60
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  triggers:
+    - type: gcp-pubsub
+      metadata:
+        subscriptionName: "placeholder-replaced-on-first-run"
+        subscriptionSize: "5"
+      authenticationRef:
+        name: gcp-keda-trigger-auth

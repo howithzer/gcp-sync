@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-consumer-baseline
+  namespace: default
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: gcp-consumer-baseline
+  template:
+    metadata:
+      labels:
+        app: gcp-consumer-baseline
+    spec:
+      containers:
+      - name: consumer
+        image: 487500748616.dkr.ecr.us-east-1.amazonaws.com/keda-multi-topic-worker:latest
+        imagePullPolicy: Always
+        env:
+          - name: GCP_PROJECT_ID
+            value: "wired-sign-858"
+          - name: GOOGLE_APPLICATION_CREDENTIALS
+            value: "/var/secrets/google/GoogleApplicationCredentials"
+          - name: CONFIG_PATH
+            value: "/app/config/topics.json"
+        volumeMounts:
+        - name: gcp-key-volume
+          mountPath: /var/secrets/google
+          readOnly: true
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+      volumes:
+      - name: gcp-key-volume
+        secret:
+          secretName: gcp-keda-auth-secret
+      - name: config-volume
+        configMap:
+          name: gcp-configmap-baseline

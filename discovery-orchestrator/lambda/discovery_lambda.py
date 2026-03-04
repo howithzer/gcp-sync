@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import boto3
 from google.cloud import pubsub_v1
 
@@ -17,7 +16,8 @@ athena_client = boto3.client('athena')
 # ---------------------------------------------------------------------------
 
 def execute_athena_query(query_string):
-    """Executes a single Athena query and waits for completion."""
+    """Executes a single Athena SQL statement and waits for completion.
+    Returns the query execution ID on success."""
     print(f"Executing Athena Query:\n{query_string}")
     response = athena_client.start_query_execution(
         QueryString=query_string,
@@ -36,27 +36,33 @@ def execute_athena_query(query_string):
         time.sleep(1)
 
 
-def athena_query_results(execution_id):
-    """Returns all data rows (skipping header) from a completed Athena query."""
+def athena_fetch_column(execution_id):
+    """Returns all values in the first column of the Athena result (skipping header row)."""
     results = athena_client.get_query_results(QueryExecutionId=execution_id)
     return [row['Data'][0]['VarCharValue'] for row in results['ResultSet']['Rows'][1:]]
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: GCP Discovery
+# ---------------------------------------------------------------------------
+
 def discover_gcp_subscriptions():
-    """Lists all Pub/Sub subscriptions in the GCP project."""
+    """Lists all Pub/Sub subscriptions currently live in the GCP project."""
     print(f"Discovering GCP Subscriptions in project: {GCP_PROJECT_ID}...")
     subscriber = pubsub_v1.SubscriberClient()
-    subs = [s.name for s in subscriber.list_subscriptions(request={"project": f"projects/{GCP_PROJECT_ID}"})]
+    subs = [s.name for s in subscriber.list_subscriptions(
+        request={"project": f"projects/{GCP_PROJECT_ID}"}
+    )]
     print(f"Found {len(subs)} subscriptions on GCP.")
     return subs
 
 
 # ---------------------------------------------------------------------------
-# Iceberg Registry Operations
+# Phase 2: Registry Operations
 # ---------------------------------------------------------------------------
 
 def ensure_iceberg_table_exists():
-    """Creates the Iceberg subscription_registry table if it doesn't already exist."""
+    """Creates the Iceberg subscription_registry table if it does not exist."""
     ddl = f"""
     CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.{ATHENA_TABLE} (
         subscription_name string,
@@ -77,9 +83,14 @@ def ensure_iceberg_table_exists():
 
 def upsert_subscriptions_to_iceberg(gcp_subs):
     """
-    MERGE all currently-discovered GCP subscriptions into the registry.
-    - New subscriptions  → INSERT  status='PENDING', usage_group='group1'
-    - Known subscriptions → UPDATE  last_seen_ts, keep existing status/group
+    MERGE all GCP-discovered subscriptions into the registry.
+
+    Rules:
+      WHEN MATCHED  → only update last_seen_ts.
+                       NEVER touch usage_group — that column is owned by ops.
+                       NEVER touch status if already ACTIVE — only reset REMOVED→PENDING.
+      WHEN NOT MATCHED → INSERT with usage_group='baseline', status='PENDING'.
+                          All new topics land in baseline; ops promotes them later.
     """
     if not gcp_subs:
         print("No GCP subscriptions discovered. Skipping upsert.")
@@ -97,75 +108,66 @@ def upsert_subscriptions_to_iceberg(gcp_subs):
     ) source
     ON target.subscription_name = source.sub_name
     WHEN MATCHED THEN
-        UPDATE SET last_seen_ts = source.seen_ts
+        UPDATE SET
+            last_seen_ts = source.seen_ts,
+            status = CASE WHEN target.status = 'REMOVED' THEN 'PENDING' ELSE target.status END
     WHEN NOT MATCHED THEN
         INSERT (subscription_name, last_seen_ts, status, usage_group)
-        VALUES (source.sub_name, source.seen_ts, 'PENDING', 'group1')
+        VALUES (source.sub_name, source.seen_ts, 'PENDING', 'baseline')
     """
-    print("Executing MERGE UPSERT into Iceberg...")
+    print("Executing MERGE UPSERT into Iceberg (usage_group is ops-owned, never overwritten)...")
     execute_athena_query(merge_query)
     print("MERGE complete.")
 
 
 def mark_removed_subscriptions(gcp_subs):
     """
-    Finds ACTIVE registry topics that are NO LONGER in GCP and marks them REMOVED.
-    This handles the negative drift case (topic deleted from GCP).
+    Finds ACTIVE registry topics that are no longer in GCP and marks them REMOVED.
+    This is the negative drift path — handles topics deleted from GCP.
     Returns the count of topics marked REMOVED.
     """
-    # Fetch all currently ACTIVE subscriptions from the registry
     exec_id = execute_athena_query(
-        f"SELECT subscription_name FROM {ATHENA_DATABASE}.{ATHENA_TABLE} WHERE status = 'ACTIVE'"
+        f"SELECT subscription_name FROM {ATHENA_DATABASE}.{ATHENA_TABLE} "
+        f"WHERE status IN ('ACTIVE', 'PENDING')"
     )
-    active_in_registry = set(athena_query_results(exec_id))
-    gcp_set = set(gcp_subs)
+    in_registry = set(athena_fetch_column(exec_id))
+    disappeared = in_registry - set(gcp_subs)
 
-    removed = active_in_registry - gcp_set
-    if not removed:
-        print("Removal check: no removed subscriptions detected.")
+    if not disappeared:
+        print("No removed subscriptions detected.")
         return 0
 
-    print(f"Removal check: {len(removed)} topic(s) deleted from GCP → marking REMOVED: {removed}")
-    names_csv = ", ".join([f"'{s}'" for s in removed])
+    print(f"Marking {len(disappeared)} topic(s) REMOVED (deleted from GCP): {disappeared}")
+    names_csv = ", ".join([f"'{s}'" for s in disappeared])
     execute_athena_query(
         f"""UPDATE {ATHENA_DATABASE}.{ATHENA_TABLE}
         SET status = 'REMOVED', last_seen_ts = current_timestamp
         WHERE subscription_name IN ({names_csv})"""
     )
-    return len(removed)
+    return len(disappeared)
 
 
-def get_group_drift_count(group):
+# ---------------------------------------------------------------------------
+# Phase 3: Group-scoped Query
+# ---------------------------------------------------------------------------
+
+def get_group_subscriptions(group):
     """
-    Group-scoped drift gate.
-    Returns count of topics in this group needing EKS patching (PENDING or REMOVED).
-    PENDING = new topic added to this group
-    REMOVED = topic deleted from GCP (needs to be dropped from KEDA/ConfigMap)
-    """
-    exec_id = execute_athena_query(
-        f"""SELECT COUNT(*) FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-        WHERE usage_group = '{group}'
-        AND status IN ('PENDING', 'REMOVED')"""
-    )
-    rows = athena_query_results(exec_id)
-    count = int(rows[0]) if rows else 0
-    print(f"Group '{group}' drift count: {count}")
-    return count
+    Returns the current non-REMOVED subscriptions for this group.
+    This is the list used to rebuild KEDA triggers and ConfigMap.
+    REMOVED topics are excluded — the rebuild drops them automatically.
 
-
-def get_active_subscriptions_for_group(group):
-    """
-    Returns current ACTIVE subscriptions for the given group.
-    These are passed to EKS patching to rebuild KEDA triggers and ConfigMap.
-    REMOVED/PENDING are excluded — KEDA/ConfigMap are rebuilt from ACTIVE only.
+    drift_count = len(result):
+      0  → group has no topics at all → skip K8s patching entirely
+      >0 → always rebuild (idempotent, ensures group stays in sync with registry)
     """
     exec_id = execute_athena_query(
         f"""SELECT subscription_name FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
         WHERE usage_group = '{group}'
-        AND status = 'ACTIVE'"""
+        AND status != 'REMOVED'"""
     )
-    subs = athena_query_results(exec_id)
-    print(f"Group '{group}' has {len(subs)} ACTIVE subscriptions for EKS patching.")
+    subs = athena_fetch_column(exec_id)
+    print(f"Group '{group}': {len(subs)} active subscription(s).")
     return subs
 
 
@@ -174,43 +176,60 @@ def get_active_subscriptions_for_group(group):
 # ---------------------------------------------------------------------------
 
 def lambda_handler(event, context):
-    print("=== Phase 4: Discovery Orchestrator ===")
+    """
+    Entry point for the Step Function DiscoverGCPSubscriptions state.
+
+    EventBridge passes   {"group": "baseline"}  or  {"group": "group1"}  etc.
+    The group determines which K8s resources to patch; discovery is always global.
+
+    Output payload:
+      {
+        "status":        "SUCCESS",
+        "group":         "baseline",
+        "total_gcp":     8,
+        "drift_count":   3,       ← topics in this group (0 = skip patching)
+        "removed":       0,
+        "subscriptions": [...]    ← topics for this group handed to EKS patcher
+      }
+    """
+    print("=== Discovery Orchestrator: Phase 4 ===")
 
     # Which group is this invocation responsible for?
-    # EventBridge passes {"group": "group1"} as the execution input.
-    group = event.get('group', 'group1')
-    print(f"Processing group: '{group}'")
+    group = event.get('group', 'baseline')
+    print(f"Invoked for group: '{group}'")
 
-    # 0. Ensure registry table exists
+    # Step 0: ensure registry table exists
     ensure_iceberg_table_exists()
 
-    # 1. Discover all current GCP subscriptions
+    # Step 1: discover all current GCP subscriptions
     gcp_subs = discover_gcp_subscriptions()
 
-    # 2. Upsert ALL discovered subscriptions (new → PENDING/group1, known → update ts)
+    # Step 2: global upsert — new topics land in baseline; usage_group never overwritten
     upsert_subscriptions_to_iceberg(gcp_subs)
 
-    # 3. Mark topics that disappeared from GCP as REMOVED (negative drift)
+    # Step 3: negative drift — mark topics deleted from GCP as REMOVED
     removed_count = mark_removed_subscriptions(gcp_subs)
 
-    # 4. Group-scoped drift gate: count PENDING + REMOVED in this group
-    drift_count = get_group_drift_count(group)
+    # Step 4: get the current subscription list for THIS group (excludes REMOVED)
+    group_subs = get_group_subscriptions(group)
 
-    # 5. Get the current ACTIVE subscriptions for this group (for EKS patching)
-    #    NOTE: We send the ACTIVE list even if drift_count > 0 from REMOVED topics,
-    #    so EKS rebuilds triggers/ConfigMap without the deleted topics.
-    group_subs = get_active_subscriptions_for_group(group)
+    # drift_count = number of topics in this group
+    # 0  → group is empty → Step Function will skip K8s patching
+    # >0 → always rebuild this group's KEDA/ConfigMap (idempotent)
+    drift_count = len(group_subs)
 
     return {
-        "status":      "SUCCESS",
-        "group":       group,
-        "total_gcp":   len(gcp_subs),
-        "drift_count": drift_count,
-        "removed":     removed_count,
-        "subscriptions": group_subs    # ACTIVE topics for this group only → EKS patching
+        "status":        "SUCCESS",
+        "group":         group,
+        "total_gcp":     len(gcp_subs),
+        "drift_count":   drift_count,
+        "removed":       removed_count,
+        "subscriptions": group_subs
     }
 
 
 if __name__ == "__main__":
     os.environ["AWS_PROFILE"] = "terraform-firehose"
-    lambda_handler({"group": "group1"}, None)
+    # Test baseline group
+    result = lambda_handler({"group": "baseline"}, None)
+    print(result)

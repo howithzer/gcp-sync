@@ -245,11 +245,26 @@ EOF
 #    Add more groups by duplicating the pattern below.
 # -----------------------------------------------------------------------------
 
-# group1: high-frequency (streaming topics) — every 5 minutes
+# baseline: default group — all newly discovered topics land here (every 5 minutes)
+resource "aws_cloudwatch_event_rule" "trigger_baseline" {
+  name                = "gcp-sync-trigger-baseline"
+  description         = "Triggers GCP Sync pipeline for baseline group every 5 minutes"
+  schedule_expression = "rate(5 minutes)"
+}
+
+resource "aws_cloudwatch_event_target" "step_function_baseline" {
+  rule      = aws_cloudwatch_event_rule.trigger_baseline.name
+  target_id = "TriggerGCPDiscoveryBaseline"
+  arn       = aws_sfn_state_machine.onboarding_orchestrator.arn
+  role_arn  = aws_iam_role.eventbridge_exec.arn
+  input     = jsonencode({ group = "baseline" })
+}
+
+# group1: promoted topics — ops moves topics here via SQL UPDATE (every 15 minutes)
 resource "aws_cloudwatch_event_rule" "trigger_group1" {
   name                = "gcp-sync-trigger-group1"
-  description         = "Triggers GCP Sync pipeline for group1 (streaming) every 5 minutes"
-  schedule_expression = "rate(5 minutes)"
+  description         = "Triggers GCP Sync pipeline for group1 every 15 minutes"
+  schedule_expression = "rate(15 minutes)"
 }
 
 resource "aws_cloudwatch_event_target" "step_function_group1" {
@@ -260,11 +275,11 @@ resource "aws_cloudwatch_event_target" "step_function_group1" {
   input     = jsonencode({ group = "group1" })
 }
 
-# group2: lower-frequency (batch/analytical topics) — every 15 minutes
+# group2: further segmentation — ops moves topics here (every 1 hour)
 resource "aws_cloudwatch_event_rule" "trigger_group2" {
   name                = "gcp-sync-trigger-group2"
-  description         = "Triggers GCP Sync pipeline for group2 (batch) every 15 minutes"
-  schedule_expression = "rate(15 minutes)"
+  description         = "Triggers GCP Sync pipeline for group2 every 1 hour"
+  schedule_expression = "rate(60 minutes)"
 }
 
 resource "aws_cloudwatch_event_target" "step_function_group2" {
