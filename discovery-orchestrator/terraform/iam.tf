@@ -105,7 +105,8 @@ resource "aws_iam_role_policy" "step_function_lambda_invoke" {
         Resource = [
           aws_lambda_function.gcp_discovery.arn,
           aws_lambda_function.gcp_ddl.arn,
-          aws_lambda_function.gcp_eks_patcher.arn
+          aws_lambda_function.gcp_eks_patcher.arn,
+          aws_lambda_function.gcp_configmap_patcher.arn
         ]
       }
     ]
