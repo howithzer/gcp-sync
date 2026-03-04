@@ -95,9 +95,9 @@ def patch_keda_autoscaler(endpoint, ca_data, token, subscriptions, group):
         }
         for sub in subscriptions
     ]
-    patch_body = json.dumps({"spec": {"triggers": triggers}})
-    url = f"{endpoint}/apis/keda.sh/v1alpha1/namespaces/{NAMESPACE}/scaledobjects/{scaledobject_name}"
-    call_eks_api(url, ca_data, token, patch_body, method="PATCH",
+    path = f"/apis/keda.sh/v1alpha1/namespaces/{NAMESPACE}/scaledobjects/{scaledobject_name}"
+    call_eks_api(endpoint, ca_data, token, path, "PATCH",
+                 {"spec": {"triggers": triggers}},
                  content_type="application/merge-patch+json")
     print(f"--> [SUCCESS] KEDA ScaledObject '{scaledobject_name}' patched with {len(subscriptions)} trigger(s).")
 
@@ -109,9 +109,9 @@ def patch_pod_configmap(endpoint, ca_data, token, subscriptions, group):
     names = _resource_names(group)
     configmap_name = names["configmap"]
     topics_json = json.dumps({"topics": [sub.split("/")[-1] for sub in subscriptions]})
-    patch_body = json.dumps({"data": {"topics.json": topics_json}})
-    url = f"{endpoint}/api/v1/namespaces/{NAMESPACE}/configmaps/{configmap_name}"
-    call_eks_api(url, ca_data, token, patch_body, method="PATCH",
+    path = f"/api/v1/namespaces/{NAMESPACE}/configmaps/{configmap_name}"
+    call_eks_api(endpoint, ca_data, token, path, "PATCH",
+                 {"data": {"topics.json": topics_json}},
                  content_type="application/strategic-merge-patch+json")
     print(f"--> [SUCCESS] ConfigMap '{configmap_name}' patched with {len(subscriptions)} topic(s).")
 
@@ -124,19 +124,11 @@ def restart_deployment(endpoint, ca_data, token, group):
     names = _resource_names(group)
     deployment_name = names["deployment"]
     restart_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    patch_body = json.dumps({
-        "spec": {
-            "template": {
-                "metadata": {
-                    "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": restart_ts
-                    }
-                }
-            }
-        }
-    })
-    url = f"{endpoint}/apis/apps/v1/namespaces/{NAMESPACE}/deployments/{deployment_name}"
-    call_eks_api(url, ca_data, token, patch_body, method="PATCH",
+    path = f"/apis/apps/v1/namespaces/{NAMESPACE}/deployments/{deployment_name}"
+    call_eks_api(endpoint, ca_data, token, path, "PATCH",
+                 {"spec": {"template": {"metadata": {"annotations": {
+                     "kubectl.kubernetes.io/restartedAt": restart_ts
+                 }}}}},
                  content_type="application/strategic-merge-patch+json")
     print(f"--> [SUCCESS] Rolling restart triggered for Deployment '{deployment_name}'.")
 
