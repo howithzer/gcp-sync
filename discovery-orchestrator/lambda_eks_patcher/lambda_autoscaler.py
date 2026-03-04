@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import time
 import urllib.request
 import urllib.error
 import ssl
@@ -8,25 +9,27 @@ import boto3
 from botocore.signers import RequestSigner
 
 # -------------------------------------------------------------------
-# Phase 4: Final Step Function Integration
-# This Lambda script forces a transactional atomic update on the EKS cluster:
-# 1. Updates KEDA Auto-Scaling Rules for the discovered topics.
-# 2. Updates the Pod ConfigMap so the pods consume the topics.
+# Phase 4: Group-Isolated EKS Patcher
+# K8s resource names are derived from the group parameter at runtime:
+#   gcp-scaler-{group}, gcp-configmap-{group}, gcp-consumer-{group}
 # -------------------------------------------------------------------
 
-import time
-
 EKS_CLUSTER_NAME = os.getenv("EKS_CLUSTER_NAME", "gcp-sync-poc-test")
-EKS_REGION = os.getenv("EKS_REGION", "us-east-1")
-NAMESPACE = os.getenv("NAMESPACE", "default")
-CONFIGMAP_NAME = "gcp-multi-topic-configmap"
-SCALEDOBJECT_NAME = "gcp-multi-topic-scaler"
-DEPLOYMENT_NAME = "gcp-multi-topic-consumer"
+EKS_REGION       = os.getenv("EKS_REGION", "us-east-1")
+NAMESPACE        = os.getenv("NAMESPACE", "default")
 
-# Athena — used to flip topic status to ACTIVE after successful EKS patching
-ATHENA_DATABASE  = os.getenv("ATHENA_DATABASE", "gcp_sync_db")
-ATHENA_TABLE     = os.getenv("ATHENA_TABLE", "subscription_registry")
-ATHENA_OUTPUT    = os.getenv("ATHENA_OUTPUT_LOC", "s3://YOUR-BUCKET/ddl/")
+# Athena — used to flip topic status PENDING/REMOVED -> ACTIVE after successful EKS patching
+ATHENA_DATABASE = os.getenv("ATHENA_DATABASE", "gcp_sync_db")
+ATHENA_TABLE    = os.getenv("ATHENA_TABLE", "subscription_registry")
+ATHENA_OUTPUT   = os.getenv("ATHENA_OUTPUT_LOC", "s3://YOUR-BUCKET/ddl/")
+
+def _resource_names(group):
+    """Returns the K8s resource names for a given group."""
+    return {
+        "scaledobject": f"gcp-scaler-{group}",
+        "configmap":    f"gcp-configmap-{group}",
+        "deployment":   f"gcp-consumer-{group}",
+    }
 
 def get_eks_token(cluster_name):
     """Generates AWS STS token for authenticating against EKS."""
@@ -75,75 +78,67 @@ def call_eks_api(endpoint, ca_data, token, path, method, payload, content_type="
     response = urllib.request.urlopen(req, context=ssl_context, timeout=10)
     return json.loads(response.read().decode('utf-8'))
 
-def patch_keda_autoscaler(endpoint, ca_data, token, topics):
+def patch_keda_autoscaler(endpoint, ca_data, token, subscriptions, group):
     """
-    Dynamically generates the KEDA Target Triggers list and patches the CRD.
-    We always send the FULL triggers array — merge-patch replaces the array entirely,
-    which is exactly what we want (rebuild from the current discovered topic list).
-    KEDA CRDs only support: merge-patch+json, json-patch+json, apply-patchyaml.
+    Rebuilds the KEDA ScaledObject triggers for the given group.
+    Uses merge-patch+json to replace the entire triggers array.
     """
-    triggers = []
-    for topic in topics:
-        triggers.append({
+    names = _resource_names(group)
+    scaledobject_name = names["scaledobject"]
+    triggers = [
+        {
             "type": "gcp-pubsub",
             "metadata": {
-                "subscriptionName": topic,
-                "subscriptionSize": "50"
-            },
-            "authenticationRef": {
-                "name": "gcp-keda-trigger-auth"
+                "subscriptionName": sub.split("/")[-1],
+                "subscriptionSize": "5"
             }
-        })
-        
-    payload = {"spec": {"triggers": triggers}}
-    path = f"/apis/keda.sh/v1alpha1/namespaces/{NAMESPACE}/scaledobjects/{SCALEDOBJECT_NAME}"
-    
-    print(f"--> [STEP 1] Patching KEDA ScaledObject with {len(triggers)} triggers...")
-    # KEDA CRDs accept merge-patch+json (not strategic-merge-patch)
-    call_eks_api(endpoint, ca_data, token, path, "PATCH", payload,
+        }
+        for sub in subscriptions
+    ]
+    patch_body = json.dumps({"spec": {"triggers": triggers}})
+    url = f"{endpoint}/apis/keda.sh/v1alpha1/namespaces/{NAMESPACE}/scaledobjects/{scaledobject_name}"
+    call_eks_api(url, ca_data, token, patch_body, method="PATCH",
                  content_type="application/merge-patch+json")
-    print("--> [SUCCESS] KEDA Autoscaler updated.")
+    print(f"--> [SUCCESS] KEDA ScaledObject '{scaledobject_name}' patched with {len(subscriptions)} trigger(s).")
 
-def patch_pod_configmap(endpoint, ca_data, token, topics):
+def patch_pod_configmap(endpoint, ca_data, token, subscriptions, group):
     """
-    Updates the ConfigMap. Core Kubernetes objects support strategic-merge-patch+json,
-    which is proven working in the eks-configmap-poc.
+    Patches the ConfigMap for the given group with the current topic list.
+    Uses strategic-merge-patch+json (correct type for core Kubernetes objects).
     """
-    payload = {"data": {"topics.json": json.dumps({"topics": topics})}}
-    path = f"/api/v1/namespaces/{NAMESPACE}/configmaps/{CONFIGMAP_NAME}"
-    
-    print(f"--> [STEP 2] Patching ConfigMap '{CONFIGMAP_NAME}' with {len(topics)} topics...")
-    call_eks_api(endpoint, ca_data, token, path, "PATCH", payload,
+    names = _resource_names(group)
+    configmap_name = names["configmap"]
+    topics_json = json.dumps({"topics": [sub.split("/")[-1] for sub in subscriptions]})
+    patch_body = json.dumps({"data": {"topics.json": topics_json}})
+    url = f"{endpoint}/api/v1/namespaces/{NAMESPACE}/configmaps/{configmap_name}"
+    call_eks_api(url, ca_data, token, patch_body, method="PATCH",
                  content_type="application/strategic-merge-patch+json")
-    print("--> [SUCCESS] ConfigMap patched.")
+    print(f"--> [SUCCESS] ConfigMap '{configmap_name}' patched with {len(subscriptions)} topic(s).")
 
-def restart_deployment(endpoint, ca_data, token):
+def restart_deployment(endpoint, ca_data, token, group):
     """
-    Triggers a rolling restart of the consumer Deployment — equivalent to:
-      kubectl rollout restart deployment/gcp-multi-topic-consumer
-    Patches the pod template annotation with the current UTC timestamp.
-    Kubernetes detects the change and cycles all pods with the new ConfigMap content.
-    No Stakater Reloader required!
+    Triggers a rolling restart of the consumer Deployment for the given group
+    by patching the pod template annotation with the current timestamp.
     """
-    import datetime
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    payload = {
+    from datetime import datetime, timezone
+    names = _resource_names(group)
+    deployment_name = names["deployment"]
+    restart_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    patch_body = json.dumps({
         "spec": {
             "template": {
                 "metadata": {
                     "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": now
+                        "kubectl.kubernetes.io/restartedAt": restart_ts
                     }
                 }
             }
         }
-    }
-    path = f"/apis/apps/v1/namespaces/{NAMESPACE}/deployments/{DEPLOYMENT_NAME}"
-    
-    print(f"--> [STEP 3] Triggering rolling restart of Deployment '{DEPLOYMENT_NAME}'...")
-    call_eks_api(endpoint, ca_data, token, path, "PATCH", payload,
+    })
+    url = f"{endpoint}/apis/apps/v1/namespaces/{NAMESPACE}/deployments/{deployment_name}"
+    call_eks_api(url, ca_data, token, patch_body, method="PATCH",
                  content_type="application/strategic-merge-patch+json")
-    print("--> [SUCCESS] Rolling restart triggered. Pods will now mount the new topic config.")
+    print(f"--> [SUCCESS] Rolling restart triggered for Deployment '{deployment_name}'.")
 
 
 def _get_subscriptions(event):
@@ -157,21 +152,24 @@ def _connect_eks():
     token = get_eks_token(EKS_CLUSTER_NAME)
     return endpoint, ca_data, token
 
-def mark_topics_active(subscriptions):
+def mark_topics_active(subscriptions, group):
     """
-    Flips the Iceberg registry status from PENDING -> ACTIVE after EKS is fully patched.
-    This gives ops a live queryable audit trail:
-      SELECT * FROM gcp_sync_db.subscription_registry WHERE status = 'PENDING'
+    After successful EKS patching:
+    - PENDING topics in this group → ACTIVE  (newly onboarded)
+    - REMOVED topics in this group → deleted from Athena perspective we leave as REMOVED
+      (they no longer appear in the ACTIVE list so KEDA/ConfigMap won't reference them)
+    Ops query: SELECT * FROM registry WHERE status IN ('PENDING','REMOVED')
     """
     if not subscriptions:
         return
     athena = boto3.client('athena', region_name=EKS_REGION)
-    names = ", ".join([f"'{s}'" for s in subscriptions])
+    names_csv = ", ".join([f"'{s}'" for s in subscriptions])
     query = f"""
     UPDATE {ATHENA_DATABASE}.{ATHENA_TABLE}
     SET status = 'ACTIVE', last_seen_ts = current_timestamp
-    WHERE subscription_name IN ({names})
-      AND status = 'PENDING'
+    WHERE subscription_name IN ({names_csv})
+    AND usage_group = '{group}'
+    AND status = 'PENDING'
     """
     resp = athena.start_query_execution(
         QueryString=query,
@@ -179,13 +177,12 @@ def mark_topics_active(subscriptions):
         ResultConfiguration={'OutputLocation': ATHENA_OUTPUT}
     )
     exec_id = resp['QueryExecutionId']
-    # Wait for completion
     while True:
         state = athena.get_query_execution(QueryExecutionId=exec_id)['QueryExecution']['Status']['State']
         if state in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
             break
         time.sleep(1)
-    print(f"--> [STATUS] Marked {len(subscriptions)} topics as ACTIVE in Iceberg registry (state={state}).")
+    print(f"--> [STATUS] Marked {len(subscriptions)} topics ACTIVE in group '{group}' (state={state}).")
 
 # ===========================================================================
 # Handler 1: keda_handler
@@ -197,16 +194,17 @@ def mark_topics_active(subscriptions):
 def keda_handler(event, context):
     print("=== [Stage 2a] KEDA ScaledObject Patcher ===")
     subscriptions = _get_subscriptions(event)
+    group = event.get('Payload', event).get('group', 'group1')
+    print(f"Group: '{group}' | Subscriptions: {len(subscriptions)}")
     if not subscriptions:
         print("No subscriptions received. Skipping.")
-        return {"status": "SKIPPED", "subscriptions": []}
+        return {"status": "SKIPPED", "subscriptions": [], "group": group}
     try:
         endpoint, ca_data, token = _connect_eks()
-        patch_keda_autoscaler(endpoint, ca_data, token, subscriptions)
-        # Pass subscriptions forward — Step Function relays this to configmap_handler after 15s wait
-        return {"status": "SUCCESS", "subscriptions": subscriptions}
+        patch_keda_autoscaler(endpoint, ca_data, token, subscriptions, group)
+        return {"status": "SUCCESS", "subscriptions": subscriptions, "group": group}
     except urllib.error.HTTPError as e:
-        raise Exception(f"KEDA PATCH FAILED: {e.read().decode('utf-8')}")
+        raise Exception(f"KEDA PATCH FAILED [{group}]: {e.read().decode('utf-8')}")
 
 # ===========================================================================
 # Handler 2: configmap_handler
@@ -217,18 +215,19 @@ def keda_handler(event, context):
 def configmap_handler(event, context):
     print("=== [Stage 2b] ConfigMap Patcher + Rolling Restart ===")
     subscriptions = _get_subscriptions(event)
+    group = event.get('Payload', event).get('group', 'group1')
+    print(f"Group: '{group}' | Subscriptions: {len(subscriptions)}")
     if not subscriptions:
         print("No subscriptions received. Skipping.")
-        return {"status": "SKIPPED"}
+        return {"status": "SKIPPED", "group": group}
     try:
         endpoint, ca_data, token = _connect_eks()
-        patch_pod_configmap(endpoint, ca_data, token, subscriptions)
-        restart_deployment(endpoint, ca_data, token)
-        # Flip Iceberg registry status PENDING -> ACTIVE now that EKS is fully patched
-        mark_topics_active(subscriptions)
-        return {"status": "SUCCESS", "patched_topics": len(subscriptions)}
+        patch_pod_configmap(endpoint, ca_data, token, subscriptions, group)
+        restart_deployment(endpoint, ca_data, token, group)
+        mark_topics_active(subscriptions, group)
+        return {"status": "SUCCESS", "patched_topics": len(subscriptions), "group": group}
     except urllib.error.HTTPError as e:
-        raise Exception(f"CONFIGMAP PATCH FAILED: {e.read().decode('utf-8')}")
+        raise Exception(f"CONFIGMAP PATCH FAILED [{group}]: {e.read().decode('utf-8')}")
 
 
 # ===========================================================================

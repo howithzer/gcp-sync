@@ -1,12 +1,10 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: gcp-multi-topic-configmap
+  name: gcp-configmap-group1
   namespace: default
 data:
   topics.json: |
     {
-      "topics": [
-        "projects/wired-sign-858/subscriptions/keda-poc-sub"
-      ]
+      "topics": []
     }

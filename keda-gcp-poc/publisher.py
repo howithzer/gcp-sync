@@ -8,7 +8,7 @@ from google.cloud import pubsub_v1
 # Run this locally to artificially inflate the GCP Pub/Sub backlog!
 # -------------------------------------------------------------------
 
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "poc-project")
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "wired-sign-858")
 TOPIC_ID = os.getenv("GCP_TOPIC_ID", "keda-poc-topic")
 
 def publish_messages(num_messages=1000):

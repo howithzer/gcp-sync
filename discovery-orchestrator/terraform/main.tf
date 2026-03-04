@@ -147,7 +147,9 @@ resource "aws_sfn_state_machine" "onboarding_orchestrator" {
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "${aws_lambda_function.gcp_discovery.arn}",
-        "Payload.$": "$"
+        "Payload": {
+          "group.$": "$.group"
+        }
       },
       "Retry": [
         {
@@ -238,19 +240,39 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# 4. Amazon EventBridge (Cron Trigger - Every 5 Minutes for Testing)
+# 4. Amazon EventBridge — Group-specific schedules
+#    Each rule passes its group as the Step Function input payload.
+#    Add more groups by duplicating the pattern below.
 # -----------------------------------------------------------------------------
-resource "aws_cloudwatch_event_rule" "every_five_minutes" {
-  name                = "trigger-discovery-every-5-mins"
-  description         = "Triggers the GCP Sync Step Function every 5 minutes"
+
+# group1: high-frequency (streaming topics) — every 5 minutes
+resource "aws_cloudwatch_event_rule" "trigger_group1" {
+  name                = "gcp-sync-trigger-group1"
+  description         = "Triggers GCP Sync pipeline for group1 (streaming) every 5 minutes"
   schedule_expression = "rate(5 minutes)"
 }
 
-resource "aws_cloudwatch_event_target" "step_function" {
-  rule      = aws_cloudwatch_event_rule.every_five_minutes.name
-  target_id = "TriggerGCPDiscoveryStepFunction"
+resource "aws_cloudwatch_event_target" "step_function_group1" {
+  rule      = aws_cloudwatch_event_rule.trigger_group1.name
+  target_id = "TriggerGCPDiscoveryGroup1"
   arn       = aws_sfn_state_machine.onboarding_orchestrator.arn
   role_arn  = aws_iam_role.eventbridge_exec.arn
+  input     = jsonencode({ group = "group1" })
+}
+
+# group2: lower-frequency (batch/analytical topics) — every 15 minutes
+resource "aws_cloudwatch_event_rule" "trigger_group2" {
+  name                = "gcp-sync-trigger-group2"
+  description         = "Triggers GCP Sync pipeline for group2 (batch) every 15 minutes"
+  schedule_expression = "rate(15 minutes)"
+}
+
+resource "aws_cloudwatch_event_target" "step_function_group2" {
+  rule      = aws_cloudwatch_event_rule.trigger_group2.name
+  target_id = "TriggerGCPDiscoveryGroup2"
+  arn       = aws_sfn_state_machine.onboarding_orchestrator.arn
+  role_arn  = aws_iam_role.eventbridge_exec.arn
+  input     = jsonencode({ group = "group2" })
 }
 
 # -----------------------------------------------------------------------------
