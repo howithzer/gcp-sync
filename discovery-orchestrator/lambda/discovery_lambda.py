@@ -93,19 +93,18 @@ def upsert_subscriptions_to_iceberg(subscriptions, status='PENDING'):
     MERGE INTO {ATHENA_DATABASE}.{ATHENA_TABLE} target
     USING (
         SELECT * FROM (
-            VALUES 
+            VALUES
             {values_str}
         ) AS t(sub_name, seen_ts, stat, u_group)
     ) source
     ON target.subscription_name = source.sub_name
     WHEN MATCHED THEN
-        UPDATE SET 
+        UPDATE SET
             last_seen_ts = source.seen_ts,
-            status = 'ACTIVE'      -- Already known and patched: mark ACTIVE
+            status = 'ACTIVE'
     WHEN NOT MATCHED THEN
         INSERT (subscription_name, last_seen_ts, status, usage_group)
-        VALUES (source.sub_name, source.seen_ts, 'PENDING', source.u_group);
-                                   -- Net-new topic: mark PENDING until EKS patched
+        VALUES (source.sub_name, source.seen_ts, 'PENDING', source.u_group)
     """
     
     print("Executing MERGE UPSERT into Iceberg...")
