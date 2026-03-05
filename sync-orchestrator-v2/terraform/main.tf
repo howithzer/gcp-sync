@@ -192,6 +192,15 @@ resource "aws_lambda_function" "patcher_keda" {
   memory_size      = 256
 
   environment { variables = local.common_env }
+
+  # ── EKS Private Cluster Networking ──────────────────────────────────────────
+  # Uncomment the block below if the EKS cluster uses a private-only API endpoint.
+  # Note: The Lambda VPC must have VPC Endpoints (or a NAT Gateway) for Athena, S3, and STS.
+  #
+  # vpc_config {
+  #   subnet_ids         = ["subnet-xxxxxxxxx", "subnet-yyyyyyyyy"] # Private subnets in EKS VPC
+  #   security_group_ids = ["sg-zzzzzzzzzzzz"]                      # Must allow outbound HTTPS (443)
+  # }
 }
 
 resource "aws_lambda_function" "patcher_configmap" {
@@ -206,6 +215,15 @@ resource "aws_lambda_function" "patcher_configmap" {
   memory_size      = 256
 
   environment { variables = local.common_env }
+
+  # ── EKS Private Cluster Networking ──────────────────────────────────────────
+  # Uncomment the block below if the EKS cluster uses a private-only API endpoint.
+  # Note: The Lambda VPC must have VPC Endpoints (or a NAT Gateway) for Athena, S3, and STS.
+  #
+  # vpc_config {
+  #   subnet_ids         = ["subnet-xxxxxxxxx", "subnet-yyyyyyyyy"] # Private subnets in EKS VPC
+  #   security_group_ids = ["sg-zzzzzzzzzzzz"]                      # Must allow outbound HTTPS (443)
+  # }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
