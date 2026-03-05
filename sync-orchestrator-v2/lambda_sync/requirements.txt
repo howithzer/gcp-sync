@@ -1,0 +1,3 @@
+# GCP Pub/Sub client — must be bundled (not in Lambda runtime)
+# boto3 and botocore are provided by the Lambda runtime
+google-cloud-pubsub==2.35.0

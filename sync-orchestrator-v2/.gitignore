@@ -1,0 +1,26 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.zip
+terraform.tfvars
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Lambda dependency packages — installed by pip, not committed.
+# Run before deploying:
+#   pip install -r lambda_sync/requirements.txt -t lambda_sync/
+lambda_sync/google/
+lambda_sync/grpc/
+lambda_sync/grpc_status/
+lambda_sync/proto/
+lambda_sync/opentelemetry/
+lambda_sync/*.dist-info/
+lambda_sync/*.so
+
+# Local
+.env
+out.json

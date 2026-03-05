@@ -1,0 +1,2 @@
+# No extra dependencies — uses only AWS SDK (boto3) and Python stdlib (urllib, ssl).
+# boto3 and botocore are provided by the Lambda runtime.
