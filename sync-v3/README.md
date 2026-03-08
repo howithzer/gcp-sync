@@ -13,15 +13,16 @@ This manual process is error-prone, slow, and does not scale well when pipelines
 ## The Solution
 `sync-v3` fully automates this bridging pipeline. The framework decouples *discovery* of Pub/Sub topics from the *deployment configuration* inside K8s.
 
-1.  **EventBridge Triggers Sync Lambda:** An EventBridge CRON rule runs `sync_lambda.py` hourly.
+1.  **EventBridge Triggers Sync Lambda:** An EventBridge scheduled rule natively invokes `sync_lambda.py` every 5 minutes.
 2.  **Pull Active Metadata:** The Lambda uses the `pubsub_v1` SDK to pull a list of all active GCP Subscriptions in the project and compares it against AWS Iceberg Registry metadata via Athena.
 3.  **Athena MERGE Upsert:** The registry is updated based on changes. Known subscriptions stay `ACTIVE`, new ones are appended as `PENDING`, and deleted/orphaned ones are flagged `REMOVED`. All interactions with Athena use strict parameterized queries (via `ExecutionParameters`) to prevent SQL injection and errors in string interpolation.
 4.  **Concurrent Guard Check:** If multiple groups have `PENDING` items, it paginates through Step Functions APIs (`list_executions`) to verify if a patch sequence is already running for a group. This prevents race conditions and corrupted K8s patches.
-5.  **Trigger Step Function:** If the group is unpatched, `sync_lambda` dynamically spins up an AWS Step Function containing the patch sequence logic.
-6.  **KEDA Path Scaling (Stage 1):** The Step Function triggers `patcher_lambda` (Phase 1). The lambda authenticates to EKS using short-lived AWS STS identities, reads the `ACTIVE` & `PENDING` list of topics from Athena, and reconstructs the triggers array inside the target `ScaledObject`.
-7.  **Patch ConfigMap (Stage 2):** It waits 15 seconds to let KEDA catch up, then patches the EKS `ConfigMap` and explicitly drops an annotation on the target K8s Deployment YAML (`restartedAt`). This annotation change natively forces a Kubernetes Rolling Restart without ever dropping the workload to zero.
-8.  **Wait For Ready Condition:** `patcher_lambda` polls the EKS API continuously, executing lazy-refreshes of its STS token on every API call (protecting against 60-second AWS credential timeouts). It waits until `updatedReplicas` and `readyReplicas` exactly match the deployment specification without any `unavailableReplicas`.
-9.  **Mark Topic Active:** Once rolling out has successfully completed and EKS reports a healthy ReplicaSet, the newly patched group in the Iceberg Registry flips from `PENDING` to `ACTIVE`.
+5.  **Execution Logging:** Even if the run is skipped (no `PENDING` items or already actively patching), an Iceberg log record is permanently generated in `discovery_execution_log` to safely track all trigger decisions and eliminate "silent failures".
+6.  **Trigger Step Function:** If the group is unpatched, `sync_lambda` dynamically spins up an AWS Step Function containing the patch sequence logic.
+7.  **KEDA Path Scaling (Stage 1):** The Step Function triggers `patcher_keda` lambda (Phase 1). The lambda authenticates to EKS using short-lived AWS STS identities mapped directly into the Kubernetes `kube-system/aws-auth` ConfigMap for `system:masters` access. It reads the `ACTIVE` & `PENDING` list of topics from Athena, and reconstructs the triggers array inside the target `ScaledObject`.
+8.  **Patch ConfigMap (Stage 2):** It triggers `patcher_configmap` lambda (Phase 2), explicitly waiting 15 seconds to let KEDA catch up, then patches the EKS `ConfigMap` and explicitly drops an annotation on the target K8s Deployment YAML (`restartedAt`). This natively forces a Kubernetes Rolling Restart without ever dropping the workload to zero.
+9.  **Wait For Ready Condition:** `patcher_configmap` polls the EKS API continuously, executing lazy-refreshes of its STS token on every API call (protecting against 60-second AWS credential timeouts). It waits until `updatedReplicas` and `readyReplicas` exactly match the deployment specification.
+10. **Mark Topic Active:** Once rolling out has successfully completed and EKS reports a healthy ReplicaSet, the newly patched group in the Iceberg Registry flips from `PENDING` to `ACTIVE`.
 
 ## System Architecture Flowchart
 
@@ -33,29 +34,32 @@ graph TD
     classDef db fill:#00a4a6,stroke:#fff,stroke-width:2px,color:white,font-weight:bold;
     classDef flow fill:#4CAF50,stroke:#fff,stroke-width:2px,color:white;
 
-    EventBridge[AWS EventBridge\nCron Trigger]:::aws -->|Hourly Invoke| SyncLambda
-    SyncLambda[Discovery Lambda\nsync_lambda.py\nPython 3]:::aws -->|1. List| PubSub(GCP Pub/Sub\nSubscriptions):::gcp
+    EventBridge[AWS EventBridge\nCron Trigger]:::aws -->|Every 5 Mins| SyncLambda
+    SyncLambda[Discovery Lambda\nsync_lambda.py\nLinux x86_64]:::aws -->|1. List| PubSub(GCP Pub/Sub\nSubscriptions):::gcp
     SyncLambda -->|2. MERGE Upsert| Iceberg[(Athena /\nIceberg Registry)]:::db
     
-    SyncLambda -->|3. Found PENDING?| SFCheck(Check Running\nStep Functions)
+    SyncLambda -->|3. Record Execution| ExecLog[(Athena /\nExecution Log)]:::db
+    SyncLambda -->|4. Found PENDING?| SFCheck(Check Running\nStep Functions)
 
     SFCheck -->|Yes, already running| SkipDrop[Skip Trigger]
-    SFCheck -->|No| SFTrigger[Start Patch Step Function]:::aws
+    SFCheck -->|No| SFTrigger[Start Patch Step Function\nGCPSync-Topic-Onboarding]:::aws
 
-    SFTrigger --> Step1[Phase 1:\nPatch KEDA]:::aws
-    Step1 --> |Rebuild Triggers| KEDA(KEDA ScaledObject):::k8s
+    SFTrigger --> Step1[Phase 1:\nPatch KEDA Lambda]:::aws
+    Step1 -.-> |1. STS Authenticate| Auth[EKS aws-auth]:::k8s
+    Step1 --> |2. Rebuild Triggers| KEDA(KEDA ScaledObject):::k8s
     
     Step1 --> Wait[Wait 15 Seconds\nKEDA Reconcile]:::flow
     
-    Wait --> Step2[Phase 2:\nConfigMap & Restart]:::aws
-    Step2 --> |Update Topics List| ConfigMap(EKS ConfigMap):::k8s
-    Step2 --> |Add restart annotation| Deploy(EKS Deployment):::k8s
+    Wait --> Step2[Phase 2:\nConfigMap Lambda]:::aws
+    Step2 -.-> |3. STS Authenticate| Auth
+    Step2 --> |4. Update Topics List| ConfigMap(EKS ConfigMap):::k8s
+    Step2 --> |5. Add restart annotation| Deploy(EKS Deployment):::k8s
     
     Deploy -->|Scaling Rules| KEDA
     
     Step2 -.-> |Poll Status| EKS(EKS API\nRollout Progress):::k8s
     EKS -.-> |Wait until 100% Ready| Step2
-    Step2 --> |4. Finish Rollout| Finalize(Update Registry)
+    Step2 --> |6. Finish Rollout| Finalize(Update Registry)
     Finalize --> |Mark topics ACTIVE| Iceberg
 ```
 
