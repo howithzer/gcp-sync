@@ -1,4 +1,4 @@
-"""
+/*
 Terraform — GCP Sync Orchestrator v3
 ======================================
 
@@ -32,7 +32,7 @@ v3 Lambda changes vs v2:
   - New env vars: KEDA_SUBSCRIPTION_SIZE, KEDA_MIN_REPLICAS,
     KEDA_MAX_REPLICAS, KEDA_POLLING_INTERVAL, ROLLOUT_TIMEOUT_SECONDS,
     ATHENA_POLL_TIMEOUT
-"""
+*/
 
 terraform {
   required_providers {
@@ -94,7 +94,7 @@ resource "aws_s3_bucket" "athena_results" {
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "aws_iam_role" "lambda_exec" {
-  name = "gcp_sync_v3_lambda_role"
+  name = "gcp_discovery_lambda_role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -200,7 +200,8 @@ resource "aws_lambda_function" "discovery" {
 
   environment {
     variables = merge(local.common_env, {
-      PATCHING_SF_ARN = aws_sfn_state_machine.patcher.arn
+      PATCHING_SF_ARN                = aws_sfn_state_machine.patcher.arn
+      GOOGLE_APPLICATION_CREDENTIALS = "gcp-service-account.json"
     })
   }
 }
@@ -272,7 +273,7 @@ resource "aws_lambda_function" "patcher_configmap" {
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "aws_iam_role" "sfn_exec" {
-  name = "gcp_sync_v3_sfn_role"
+  name = "gcp_sync_step_function_role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -350,7 +351,7 @@ resource "aws_sfn_state_machine" "patcher" {
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "aws_iam_role" "eventbridge_exec" {
-  name = "gcp_sync_v3_eventbridge_role"
+  name = "gcp_sync_eventbridge_role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -437,6 +438,6 @@ resource "aws_cloudwatch_event_target" "patching" {
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "aws_athena_database" "gcp_sync" {
-  name   = "gcp_sync_db"
+  name   = "gcp_sync_db_v3"
   bucket = aws_s3_bucket.athena_results.bucket
 }
