@@ -59,7 +59,7 @@ locals {
     ATHENA_TABLE         = "subscription_registry"
     ATHENA_OUTPUT_LOC    = "s3://${aws_s3_bucket.athena_results.bucket}/patcher/"
     ICEBERG_DATA_BUCKET  = aws_s3_bucket.iceberg_data.bucket
-    EKS_CLUSTER_NAME     = "gcp-sync-cluster"
+    EKS_CLUSTER_NAME     = "gcp-sync-poc-test"
     EKS_REGION           = "us-east-1"
     NAMESPACE            = "default"
     GCP_PROJECT_ID       = "wired-sign-858"
