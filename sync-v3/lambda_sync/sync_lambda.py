@@ -145,8 +145,8 @@ def _discover_gcp_subscriptions():
 # Phase 2: Registry Sync
 # ---------------------------------------------------------------------------
 
-def _ensure_table():
-    """Creates the Iceberg registry table if it does not exist."""
+def _ensure_tables():
+    """Creates the Iceberg registry and execution log tables if they do not exist."""
     _run_query(f"""
     CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.{ATHENA_TABLE} (
         subscription_name string,
@@ -172,6 +172,41 @@ def _ensure_table():
         )
     except Exception:
         pass  # Column already exists
+
+    _run_query(f"""
+    CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.discovery_execution_log (
+        execution_ts      timestamp,
+        total_gcp_topics  int,
+        removed_topics    int,
+        groups_triggered  string,
+        groups_skipped    string
+    )
+    LOCATION 's3://{ICEBERG_DATA_BUCKET}/discovery_execution_log/'
+    TBLPROPERTIES (
+        'table_type'='ICEBERG',
+        'format'='parquet',
+        'write_compression'='snappy'
+    )
+    """, timeout=60)
+
+
+def _log_execution(total_gcp, removed, triggered, skipped):
+    """
+    Inserts a record into the discovery_execution_log table so silent triggers are tracked.
+    """
+    triggered_str = ",".join(triggered) if triggered else "NONE"
+    skipped_str   = ",".join(skipped) if skipped else "NONE"
+
+    _run_query(
+        f"""
+        INSERT INTO {ATHENA_DATABASE}.discovery_execution_log 
+        (execution_ts, total_gcp_topics, removed_topics, groups_triggered, groups_skipped)
+        VALUES (current_timestamp, ?, ?, ?, ?)
+        """,
+        params=[str(total_gcp), str(removed), triggered_str, skipped_str],
+        timeout=60
+    )
+
 
 
 def _upsert(gcp_subs):
@@ -357,12 +392,14 @@ def lambda_handler(event, context):
     """Runs on the hourly EventBridge schedule."""
     print("=== GCP Sync Discovery Service (v3) ===")
 
-    _ensure_table()
+    _ensure_tables()
 
     gcp_subs           = _discover_gcp_subscriptions()
     _upsert(gcp_subs)
     removed            = _mark_removed(gcp_subs)
     triggered, skipped = _trigger_patching_for_groups_with_pending()
+
+    _log_execution(len(gcp_subs), removed, triggered, skipped)
 
     return {
         "status":           "SUCCESS",
