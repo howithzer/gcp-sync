@@ -301,7 +301,7 @@ resource "aws_iam_role_policy" "sfn_invoke_lambda" {
 }
 
 resource "aws_sfn_state_machine" "patcher" {
-  name     = "GCPSync-Patcher-v3"
+  name     = "GCPSync-Topic-Onboarding"
   role_arn = aws_iam_role.sfn_exec.arn
 
   definition = jsonencode({
@@ -347,7 +347,7 @@ resource "aws_sfn_state_machine" "patcher" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EventBridge — Discovery Schedule (hourly)
+# EventBridge — Discovery Schedule
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "aws_iam_role" "eventbridge_exec" {
@@ -383,7 +383,7 @@ resource "aws_iam_role_policy" "eventbridge_permissions" {
 }
 
 resource "aws_cloudwatch_event_rule" "discovery_hourly" {
-  name                = "gcp-sync-discovery-hourly-v3"
+  name                = "trigger-discovery-every-5-mins"
   description         = "Syncs GCP subscriptions to Iceberg registry every 5 minutes"
   schedule_expression = "rate(5 minutes)"
 }
@@ -401,36 +401,6 @@ resource "aws_lambda_permission" "allow_eventbridge_discovery" {
   function_name = aws_lambda_function.discovery.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.discovery_hourly.arn
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EventBridge — Patching Schedules (per group, every 4 hours)
-# ─────────────────────────────────────────────────────────────────────────────
-
-locals {
-  patch_groups = {
-    # Staggered schedules are less important for POC, firing every 7 minutes
-    # Format: rate(7 minutes)
-    baseline = "rate(7 minutes)"
-    group1   = "rate(7 minutes)"
-    group2   = "rate(7 minutes)"
-  }
-}
-
-resource "aws_cloudwatch_event_rule" "patching" {
-  for_each            = local.patch_groups
-  name                = "gcp-sync-patch-${each.key}-v3"
-  description         = "Triggers K8s patching for group '${each.key}': ${each.value}"
-  schedule_expression = each.value
-}
-
-resource "aws_cloudwatch_event_target" "patching" {
-  for_each  = local.patch_groups
-  rule      = aws_cloudwatch_event_rule.patching[each.key].name
-  target_id = "TriggerPatchFor${title(each.key)}"
-  arn       = aws_sfn_state_machine.patcher.arn
-  role_arn  = aws_iam_role.eventbridge_exec.arn
-  input     = jsonencode({ group = each.key, trigger = "scheduled" })
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
