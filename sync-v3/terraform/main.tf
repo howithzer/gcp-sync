@@ -55,7 +55,7 @@ locals {
 
   # ── environment shared by both lambdas ──────────────────────────────────
   common_env = {
-    ATHENA_DATABASE      = "gcp_sync_db"
+    ATHENA_DATABASE      = "gcp_sync_db_v3"
     ATHENA_TABLE         = "subscription_registry"
     ATHENA_OUTPUT_LOC    = "s3://${aws_s3_bucket.athena_results.bucket}/patcher/"
     ICEBERG_DATA_BUCKET  = aws_s3_bucket.iceberg_data.bucket
@@ -128,7 +128,7 @@ resource "aws_iam_role_policy" "lambda_permissions" {
       {
         Sid    = "S3DataAndResults"
         Effect = "Allow"
-        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"]
         Resource = [
           aws_s3_bucket.iceberg_data.arn,   "${aws_s3_bucket.iceberg_data.arn}/*",
           aws_s3_bucket.athena_results.arn, "${aws_s3_bucket.athena_results.arn}/*"
