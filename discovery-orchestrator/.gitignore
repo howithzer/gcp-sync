@@ -12,8 +12,47 @@ __pycache__/
 dist/
 .venv/
 venv/
+out.json
+
+# Lambda dependency folders — installed by pip, not committed to git.
+# Run: pip install -r requirements.txt -t <lambda_folder>/ before deploying.
+lambda/boto3/
+lambda/botocore/
+lambda/bin/
+lambda/google/
+lambda/grpc/
+lambda/grpc_status/
+lambda/certifi/
+lambda/cffi/
+lambda/charset_normalizer/
+lambda/cryptography/
+lambda/dateutil/
+lambda/idna/
+lambda/importlib_metadata/
+lambda/jmespath/
+lambda/opentelemetry/
+lambda/proto/
+lambda/urllib3/
+lambda/s3transfer/
+lambda/six.py
+lambda/typing_extensions.py
+lambda/*.dist-info/
+lambda/*.so
+lambda_ddl/boto3/
+lambda_ddl/botocore/
+lambda_ddl/bin/
+lambda_ddl/certifi/
+lambda_ddl/charset_normalizer/
+lambda_ddl/dateutil/
+lambda_ddl/idna/
+lambda_ddl/jmespath/
+lambda_ddl/urllib3/
+lambda_ddl/s3transfer/
+lambda_ddl/six.py
+lambda_ddl/typing_extensions.py
+lambda_ddl/*.dist-info/
+lambda_ddl/*.so
 
 # Local config
 .env
 *.json.bak
-out.json
