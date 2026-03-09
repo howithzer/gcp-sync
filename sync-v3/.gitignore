@@ -1,0 +1,66 @@
+# ── GCP credentials (never commit service account keys) ─────────────────────
+gcp-service-account.json
+*.json
+
+# ── Vendored Lambda dependencies (pip install -t .) ─────────────────────────
+lambda_sync/bin/
+lambda_sync/certifi/
+lambda_sync/certifi-*/
+lambda_sync/cffi/
+lambda_sync/cffi-*/
+lambda_sync/charset_normalizer/
+lambda_sync/charset_normalizer-*/
+lambda_sync/cryptography/
+lambda_sync/cryptography-*/
+lambda_sync/google/
+lambda_sync/google_api_core-*/
+lambda_sync/google_auth-*/
+lambda_sync/google_cloud_pubsub-*/
+lambda_sync/googleapis_common_protos-*/
+lambda_sync/grpc/
+lambda_sync/grpc_google_iam_v1-*/
+lambda_sync/grpc_status/
+lambda_sync/grpcio-*/
+lambda_sync/grpcio_status-*/
+lambda_sync/idna/
+lambda_sync/idna-*/
+lambda_sync/importlib_metadata/
+lambda_sync/importlib_metadata-*/
+lambda_sync/opentelemetry/
+lambda_sync/opentelemetry_api-*/
+lambda_sync/opentelemetry_sdk-*/
+lambda_sync/opentelemetry_semantic_conventions-*/
+lambda_sync/proto/
+lambda_sync/proto_plus-*/
+lambda_sync/protobuf-*/
+lambda_sync/pyasn1/
+lambda_sync/pyasn1-*/
+lambda_sync/pyasn1_modules/
+lambda_sync/pyasn1_modules-*/
+lambda_sync/pycparser/
+lambda_sync/pycparser-*/
+lambda_sync/requests/
+lambda_sync/requests-*/
+lambda_sync/rsa/
+lambda_sync/rsa-*/
+lambda_sync/urllib3/
+lambda_sync/urllib3-*/
+lambda_sync/zipp/
+lambda_sync/zipp-*/
+lambda_sync/typing_extensions.py
+lambda_sync/typing_extensions-*/
+
+# ── Compiled extensions bundled with packages ────────────────────────────────
+*.so
+*.pyd
+
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Terraform build artifacts and state ──────────────────────────────────────
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/*.zip

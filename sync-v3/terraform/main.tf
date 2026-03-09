@@ -2,30 +2,37 @@
 Terraform — GCP Sync Orchestrator v3
 ======================================
 
-Two independent services with separate schedules:
+Two independent services with cleanly separated responsibilities:
 
-  Discovery Service  (rate = 5 minutes)
+  Discovery Service  (every 5 minutes)
   ─────────────────
   EventBridge → Lambda: gcp-sync-discovery-v3
-    - Discovers all GCP Pub/Sub subscriptions
+    - Discovers all GCP Pub/Sub subscriptions from GCP
     - Upserts into Iceberg registry (new → baseline/PENDING)
     - Marks REMOVED (deleted or orphaned subscriptions)
-    - [v3] Checks for RUNNING Step Function executions before triggering
-           on-demand patching to prevent concurrent patch conflicts.
+    - Writes execution summary to discovery_execution_log
+    - Does NOT trigger patching — registry sync only
 
-  Patching Service  (rate = 7 minutes, one rule per group)
-  ───────────────────────────────────────────────────────
-  EventBridge → Step Function: GCPSync-Patcher-v3
+  Patching Service  (every 4 hours, one staggered rule per group)
+  ───────────────────────────────────────────────────────────────
+  EventBridge → Step Function: GCPSync-Topic-Onboarding
     State 1: PatchKEDA      → Lambda: gcp-sync-patcher-keda-v3
     State 2: WaitForKEDA    → 15 seconds
     State 3: PatchConfigMap → Lambda: gcp-sync-patcher-configmap-v3
+               [v3] Creates KEDA/ConfigMap if missing (bootstrap-safe)
                [v3] Verifies Deployment exists before restarting
                [v3] Polls Deployment rollout until all pods are Ready
                [v3] Only marks ACTIVE after rollout confirms healthy pods
 
-v3 IAM additions vs v2:
-  - states:ListExecutions, states:DescribeExecution on the patcher state
-    machine (required by the concurrent patch guard in the Discovery Lambda)
+  Scheduling design
+  -----------------
+  Groups are staggered 15 minutes apart so at most one group is patching
+  at any given time. With ~100-150 topics per group this keeps each rolling
+  restart blast radius bounded and predictable.
+
+  To add a new group: add an entry to local.patch_groups and run terraform apply.
+  To reassign topics between groups, run an Athena UPDATE on usage_group;
+  the next scheduled patch for each affected group reconciles automatically.
 
 v3 Lambda changes vs v2:
   - patcher_configmap timeout raised to 360s (accommodates rollout polling)
@@ -155,24 +162,9 @@ resource "aws_iam_role_policy" "lambda_permissions" {
         Action = ["secretsmanager:GetSecretValue"]
         Resource = "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:gcp-service-account*"
       },
-      {
-        Sid    = "TriggerPatchingSF"
-        Effect = "Allow"
-        Action = ["states:StartExecution"]
-        Resource = aws_sfn_state_machine.patcher.arn
-      },
-      {
-        # [v3] Required by the concurrent patch guard in the Discovery Lambda.
-        # list_executions returns running executions; describe_execution reads
-        # the input JSON to identify which group each execution is patching.
-        Sid    = "InspectRunningPatchExecutions"
-        Effect = "Allow"
-        Action = [
-          "states:ListExecutions",
-          "states:DescribeExecution"
-        ]
-        Resource = aws_sfn_state_machine.patcher.arn
-      }
+      # Note: no states:* permissions for the Lambda role.
+      # The Discovery Lambda is a pure registry-sync service.
+      # All patching is triggered by EventBridge scheduled rules (see below).
     ]
   })
 }
@@ -200,7 +192,6 @@ resource "aws_lambda_function" "discovery" {
 
   environment {
     variables = merge(local.common_env, {
-      PATCHING_SF_ARN                = aws_sfn_state_machine.patcher.arn
       GOOGLE_APPLICATION_CREDENTIALS = "gcp-service-account.json"
     })
   }
@@ -401,6 +392,45 @@ resource "aws_lambda_permission" "allow_eventbridge_discovery" {
   function_name = aws_lambda_function.discovery.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.discovery_hourly.arn
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EventBridge — Patching Schedules (per group, every 4 hours, staggered)
+#
+# Groups are offset 15 minutes apart so only one group ever patches at a time.
+# Each execution rebuilds the full KEDA + ConfigMap for that group from the
+# current registry state — covering new topics, reassigned topics, and drift.
+#
+# Sizing guidance: aim for ~100-150 topics per group to keep rolling restart
+# duration bounded.  Add new groups here and run `terraform apply`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+locals {
+  patch_groups = {
+    # cron(Minutes Hours Day-of-month Month Day-of-week Year)
+    baseline = "cron(0  0,4,8,12,16,20 * * ? *)"   # every 4h at :00
+    group1   = "cron(15 0,4,8,12,16,20 * * ? *)"   # every 4h at :15  (+15 min)
+    group2   = "cron(30 0,4,8,12,16,20 * * ? *)"   # every 4h at :30  (+30 min)
+    group3   = "cron(45 0,4,8,12,16,20 * * ? *)"   # every 4h at :45  (+45 min)
+    group4   = "cron(0  2,6,10,14,18,22 * * ? *)"  # every 4h at :00, offset +2h
+    group5   = "cron(15 2,6,10,14,18,22 * * ? *)"  # every 4h at :15, offset +2h
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "patching" {
+  for_each            = local.patch_groups
+  name                = "gcp-sync-patch-${each.key}"
+  description         = "Patches KEDA + ConfigMap for group '${each.key}' every 4h"
+  schedule_expression = each.value
+}
+
+resource "aws_cloudwatch_event_target" "patching" {
+  for_each  = local.patch_groups
+  rule      = aws_cloudwatch_event_rule.patching[each.key].name
+  target_id = "TriggerPatchFor${title(each.key)}"
+  arn       = aws_sfn_state_machine.patcher.arn
+  role_arn  = aws_iam_role.eventbridge_exec.arn
+  input     = jsonencode({ group = each.key, trigger = "scheduled" })
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
