@@ -1,0 +1,262 @@
+{
+  "Comment": "Per-topic Data Factory Step Function — [TOPIC_NAME_PLACEHOLDER]. Handles incremental RAW→STD→CUR promotion with HWM-based skip logic, exponential backoff retry, and failure notification. BatchId is the correlation ID that propagates through every state for CloudWatch tracing.",
+  "StartAt": "GetTopicConfig",
+  "States": {
+
+    "GetTopicConfig": {
+      "Comment": "Stage 1: Fetch topic metadata from DynamoDB. Returns partition keys, CDE columns, Glue job ARNs, Nuclear_Option flag, and current HWM snapshot IDs. The BatchId is injected by the EKS orchestrator before invocation.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:REGION:ACCOUNT_ID:function:df_get_topic_config",
+        "Payload": {
+          "topic_name.$":  "$.topic_name",
+          "batch_id.$":    "$.batch_id",
+          "caller":        "StepFunction"
+        }
+      },
+      "ResultSelector": {
+        "config.$": "$.Payload"
+      },
+      "ResultPath": "$.stage1",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "OnFailureNotify"
+        }
+      ],
+      "Next": "ValidateWork"
+    },
+
+    "ValidateWork": {
+      "Comment": "Stage 2: Compare the RAW table's current max snapshot ID against the stored HWM snapshot ID in DynamoDB. Returns has_new_data (bool), starting_snapshot, ending_snapshot, and nuclear_option flag.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:REGION:ACCOUNT_ID:function:df_validate_work",
+        "Payload": {
+          "topic_name.$":        "$.topic_name",
+          "batch_id.$":          "$.batch_id",
+          "topic_config.$":      "$.stage1.config",
+          "raw_table_name.$":    "$.stage1.config.raw_table_name",
+          "staging_hwm_snap.$":  "$.stage1.config.staging_hwm_snapshot_id",
+          "target_hwm_snap.$":   "$.stage1.config.target_hwm_snapshot_id"
+        }
+      },
+      "ResultSelector": {
+        "validation.$": "$.Payload"
+      },
+      "ResultPath": "$.stage2",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "OnFailureNotify"
+        }
+      ],
+      "Next": "CheckNewData"
+    },
+
+    "CheckNewData": {
+      "Comment": "Choice: if no new snapshots exist since last HWM, end cleanly. Otherwise proceed to execution. Nuclear_Option bypasses the check and forces full reload.",
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Or": [
+            {
+              "Variable": "$.stage2.validation.has_new_data",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.stage1.config.nuclear_option",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "RunSTDGlueJob"
+        }
+      ],
+      "Default": "NoNewDataEnd"
+    },
+
+    "NoNewDataEnd": {
+      "Comment": "No incremental data detected and nuclear_option is false. End the execution cleanly — EKS orchestrator will retry on next polling cycle.",
+      "Type": "Succeed"
+    },
+
+    "RunSTDGlueJob": {
+      "Comment": "Stage 3a: Trigger the topic-specific STD Glue job (cloned from golden image). Passes batch_id, snapshot range, and full_reload flag derived from nuclear_option. Job name follows convention: [topic]_std_glue_job.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "$.stage1.config.std_glue_job_name",
+        "Arguments": {
+          "--topic_name.$":         "$.topic_name",
+          "--batch_id.$":           "$.batch_id",
+          "--starting_snapshot.$":  "$.stage2.validation.starting_snapshot",
+          "--ending_snapshot.$":    "$.stage2.validation.ending_snapshot",
+          "--target_layer":         "STD",
+          "--full_reload.$":        "States.Format('{}', $.stage1.config.nuclear_option)"
+        }
+      },
+      "ResultPath": "$.stage3a",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.AmazonGlueException",
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "OnFailureNotify"
+        }
+      ],
+      "Next": "RunCURGlueJob"
+    },
+
+    "RunCURGlueJob": {
+      "Comment": "Stage 3b: Trigger the topic-specific CUR Glue job. Reads from STD table produced in 3a. Same batch_id continues for end-to-end correlation. Job name: [topic]_cur_glue_job.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "$.stage1.config.cur_glue_job_name",
+        "Arguments": {
+          "--topic_name.$":        "$.topic_name",
+          "--batch_id.$":          "$.batch_id",
+          "--starting_snapshot.$": "$.stage2.validation.starting_snapshot",
+          "--ending_snapshot.$":   "$.stage2.validation.ending_snapshot",
+          "--target_layer":        "CUR",
+          "--full_reload.$":       "States.Format('{}', $.stage1.config.nuclear_option)"
+        }
+      },
+      "ResultPath": "$.stage3b",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.AmazonGlueException",
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "OnFailureNotify"
+        }
+      ],
+      "Next": "CommitOffsets"
+    },
+
+    "CommitOffsets": {
+      "Comment": "Stage 4: Write the new HWM snapshot IDs back to DynamoDB for both STD and CUR layers. Also resets nuclear_option to false and increments successful run counter. This is the ONLY place HWM advances — Glue jobs never write to DynamoDB directly.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:REGION:ACCOUNT_ID:function:df_commit_offsets",
+        "Payload": {
+          "topic_name.$":            "$.topic_name",
+          "batch_id.$":              "$.batch_id",
+          "new_staging_snapshot.$":  "$.stage2.validation.ending_snapshot",
+          "new_target_snapshot.$":   "$.stage2.validation.ending_snapshot",
+          "std_glue_run_id.$":       "$.stage3a.Id",
+          "cur_glue_run_id.$":       "$.stage3b.Id",
+          "reset_nuclear_option":    true
+        }
+      },
+      "ResultPath": "$.stage4",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0,
+          "Comment": "High retry count — losing an offset commit is worse than a duplicate call."
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "OnFailureNotify"
+        }
+      ],
+      "Next": "PipelineSuccess"
+    },
+
+    "PipelineSuccess": {
+      "Comment": "Terminal success state. EKS orchestrator checks SF execution status via DescribeExecution — SUCCEEDED here means HWM has been safely advanced.",
+      "Type": "Succeed"
+    },
+
+    "OnFailureNotify": {
+      "Comment": "Catch-all failure handler. Increments Staging_Rerun_Count in DynamoDB, publishes to SNS for alerting, and logs the full error context including batch_id for CloudWatch investigation. Does NOT advance HWM — safe to re-run.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:REGION:ACCOUNT_ID:function:df_on_failure",
+        "Payload": {
+          "topic_name.$":   "$.topic_name",
+          "batch_id.$":     "$.batch_id",
+          "error_detail.$": "$.error",
+          "failed_state":   "PIPELINE_FAILURE",
+          "sns_topic_arn":  "arn:aws:sns:REGION:ACCOUNT_ID:df_pipeline_failures"
+        }
+      },
+      "ResultPath": "$.failure_notification",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "PipelineFailed"
+    },
+
+    "PipelineFailed": {
+      "Comment": "Terminal failure state. EKS orchestrator reads FAILED status and can apply topic-level backoff before next scheduling attempt.",
+      "Type": "Fail",
+      "Error": "DataFactoryPipelineError",
+      "Cause": "One or more pipeline stages failed. Check OnFailureNotify logs and DynamoDB Staging_Rerun_Count for this topic."
+    }
+
+  }
+}
